@@ -447,6 +447,10 @@ def _set_global_settings_for_dcc(text, dcc):
     if dcc == "maya":
         axis = {"UpAxis": 1, "UpAxisSign": 1, "FrontAxis": 2, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
     elif dcc == "unreal":
+        # Unreal camera FBX import expects a Z-up basis in global settings.
+        # We keep FBX units in centimeters (UnitScaleFactor=100) to match Unreal's
+        # importer expectations for scene scale while camera FilmOffset values remain
+        # authored in FBX camera units (inches; see _unreal_film_offset_from_reframe).
         axis = {"UpAxis": 2, "UpAxisSign": 1, "FrontAxis": 1, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
     else:  # nuke
         axis = {"UpAxis": 1, "UpAxisSign": 1, "FrontAxis": 2, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
@@ -627,6 +631,18 @@ def _patch_property_static(full_text, target_model_name, property_name, op):
     return full_text
 
 
+def _unreal_film_offset_from_reframe(comp):
+    # Unreal-target mapping for FBX camera offsets.
+    # Units are inches because FBX FilmOffsetX/Y camera properties are in inches.
+    # Y is inverted relative to Nuke/Maya reframe math to match Unreal import behavior.
+    return {
+        "properties": ("FilmOffsetX", "FilmOffsetY"),
+        "delta_x": comp["delta_hfo_in"],
+        "delta_y": -comp["delta_vfo_in"],
+        "units": "in",
+    }
+
+
 def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=False):
     scale = comp["scale"]
     text = source_text
@@ -668,6 +684,7 @@ def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_
 def _dcc_adjustments(comp):
     focal_old = comp["focal_mm"]
     focal_new = focal_old * comp["scale"]
+    unreal_offsets = _unreal_film_offset_from_reframe(comp)
     return {
         "nuke": {
             "focal_old_mm": focal_old,
@@ -684,8 +701,9 @@ def _dcc_adjustments(comp):
         "unreal": {
             "focal_old_mm": focal_old,
             "focal_new_mm": focal_new,
-            "delta_x_in": comp["delta_hfo_in"],
-            "delta_y_in": -comp["delta_vfo_in"],
+            "delta_x": unreal_offsets["delta_x"],
+            "delta_y": unreal_offsets["delta_y"],
+            "units": unreal_offsets["units"],
         },
     }
 
@@ -720,8 +738,8 @@ def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fb
         "  Maya   -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
             dcc["maya"]["focal_old_mm"], dcc["maya"]["focal_new_mm"], dcc["maya"]["delta_x_in"], dcc["maya"]["delta_y_in"]
         ),
-        "  Unreal -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
-            dcc["unreal"]["focal_old_mm"], dcc["unreal"]["focal_new_mm"], dcc["unreal"]["delta_x_in"], dcc["unreal"]["delta_y_in"]
+        "  Unreal -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) {} (FBX FilmOffsetX/Y mapping, Y inverted)".format(
+            dcc["unreal"]["focal_old_mm"], dcc["unreal"]["focal_new_mm"], dcc["unreal"]["delta_x"], dcc["unreal"]["delta_y"], dcc["unreal"]["units"]
         ),
         "",
         "Output folder:",
