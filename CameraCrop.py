@@ -284,6 +284,27 @@ def _set_existing_prop(text, name, value):
     return pat.sub(lambda m: "{}{}{}".format(m.group(1), val, m.group(3)), text, count=1)
 
 
+def _set_or_add_numeric_prop(block_text, name, value):
+    updated = _set_existing_prop(block_text, name, value)
+    if updated != block_text:
+        return updated
+
+    m = re.search(r'(^[ \t]*Properties70:\s*\{\s*\r?\n)', block_text, re.MULTILINE)
+    if not m:
+        return block_text
+
+    props_body = block_text[m.end():]
+    p = re.search(r'^[ \t]*P:\s*"', props_body, re.MULTILINE)
+    if p:
+        indent = re.match(r'[ \t]*', props_body[p.start():]).group(0)
+    else:
+        indent = " " * 12
+
+    val = "{:.15g}".format(float(value))
+    line = '{}P: "{}", "Number", "", "A",{}\n'.format(indent, name, val)
+    return block_text[:m.end()] + line + block_text[m.end():]
+
+
 def _parse_float_array_block(array_text):
     tokens = [v.strip() for v in array_text.split(",") if v.strip()]
     if not tokens:
@@ -336,9 +357,10 @@ def _patch_property_everywhere(full_text, target_model_name, property_name, op):
 
     replacements = []
 
-    old_attr_val = _get_prop(attr["text"], property_name, None)
-    if old_attr_val is not None:
-        replacements.append((attr["start"], attr["end"], _set_existing_prop(attr["text"], property_name, op(old_attr_val))))
+    old_attr_val = _get_prop(attr["text"], property_name, 0.0)
+    attr_rewrite = _set_or_add_numeric_prop(attr["text"], property_name, op(old_attr_val))
+    if attr_rewrite != attr["text"]:
+        replacements.append((attr["start"], attr["end"], attr_rewrite))
 
     curve_node = None
     for src_id, dst_id, prop_name in op_conns:
@@ -594,7 +616,7 @@ def _patch_property_static(full_text, target_model_name, property_name, op):
     old_val = _get_prop(attr["text"], property_name, 0.0)
     new_val = op(old_val)
 
-    attr_new = _set_existing_prop(attr["text"], property_name, new_val)
+    attr_new = _set_or_add_numeric_prop(attr["text"], property_name, new_val)
     if attr_new != attr["text"]:
         full_text = full_text[:attr["start"]] + attr_new + full_text[attr["end"]:]
 
@@ -748,7 +770,6 @@ def bake_selected_transform_into_cameras():
     else:
         temp_src = _to_nuke_path(os.path.join(out_dir, output_names["nuke"] + ".tmp_export_source.fbx"))
         static_only = _camera_is_static_in_nuke(camera)
-        source_is_static = static_only
         _export_camera_to_ascii_fbx(camera, temp_src, static_only=static_only)
         if not os.path.exists(temp_src):
             raise ReframeBakeError("Failed to export source FBX from camera.")
@@ -760,8 +781,10 @@ def bake_selected_transform_into_cameras():
         except Exception:
             pass
 
+    force_static_rewrite = source_is_static if source_fbx else _camera_is_static_in_nuke(camera)
+
     for dcc in ("nuke", "maya", "unreal"):
-        patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=source_is_static)
+        patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=force_static_rewrite)
         _write_text(output_paths[dcc], patched)
 
     imported = _create_imported_camera(output_paths["nuke"], target_model_name, camera)
