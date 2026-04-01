@@ -490,6 +490,9 @@ def _compute_reframe(transform, camera):
     shift_x_px = tx + (1.0 - scale) * (cx - frame_w * 0.5)
     shift_y_px = ty + (1.0 - scale) * (cy - frame_h * 0.5)
 
+    delta_u = (shift_x_px / frame_w)
+    delta_v = (shift_y_px / frame_h)
+
     return {
         "tx": tx,
         "ty": ty,
@@ -503,10 +506,10 @@ def _compute_reframe(transform, camera):
         "focal_mm": focal_mm,
         "shift_x_px": shift_x_px,
         "shift_y_px": shift_y_px,
-        "delta_u": (shift_x_px / frame_w),
-        "delta_v": (shift_y_px / frame_h),
-        "delta_hfo_in": (shift_x_px / frame_w) * (sensor_w_mm * MM_TO_INCH),
-        "delta_vfo_in": (shift_y_px / frame_h) * (sensor_h_mm * MM_TO_INCH),
+        "delta_u": delta_u,
+        "delta_v": delta_v,
+        "delta_hfo_in": delta_u * (sensor_w_mm * MM_TO_INCH),
+        "delta_vfo_in": delta_v * (sensor_h_mm * MM_TO_INCH),
     }
 
 
@@ -652,23 +655,27 @@ def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_
     text = apply_prop(text, "FocalLength", lambda old: old * scale)
 
     if dcc == "nuke":
-        # Nuke import maps FBX FilmOffsetX/Y to win_translate u/v.
-        dx = comp["delta_hfo_in"]
-        dy = comp["delta_vfo_in"]
+        # Nuke consumes win_translate in normalized filmback units (u/v), while FBX stores FilmOffset in inches.
+        # Convert desired win_translate deltas to FBX FilmOffset deltas using the camera filmback size.
+        dx = _nuke_win_translate_to_film_offset_in(comp["delta_u"], comp["sensor_w_mm"])
+        dy = _nuke_win_translate_to_film_offset_in(comp["delta_v"], comp["sensor_h_mm"])
+        # FBX FilmOffsetX/Y are inch values; after import, Nuke converts them back to normalized win_translate.
         text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
         text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
     elif dcc == "maya":
         dx = comp["delta_hfo_in"]
         dy = comp["delta_vfo_in"]
+        # Maya consumes FBX FilmOffsetX/Y as film offset inches.
         text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
         text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
     else:  # unreal
-        unreal_offsets = _unreal_film_offset_from_reframe(comp)
-        prop_x, prop_y = unreal_offsets["properties"]
-        text = apply_prop(text, prop_x, lambda old, _dx=unreal_offsets["delta_x"]: old + _dx)
-        text = apply_prop(text, prop_y, lambda old, _dy=unreal_offsets["delta_y"]: old + _dy)
+        dx = comp["delta_hfo_in"]
+        dy = -comp["delta_vfo_in"]
+        # Unreal also consumes FBX FilmOffsetX/Y as inches, with opposite Y sign convention.
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
     text = _set_global_settings_for_dcc(text, dcc)
     return text
@@ -682,8 +689,8 @@ def _dcc_adjustments(comp):
         "nuke": {
             "focal_old_mm": focal_old,
             "focal_new_mm": focal_new,
-            "delta_x_in": comp["delta_hfo_in"],
-            "delta_y_in": comp["delta_vfo_in"],
+            "delta_x_win_translate": comp["delta_u"],
+            "delta_y_win_translate": comp["delta_v"],
         },
         "maya": {
             "focal_old_mm": focal_old,
@@ -699,6 +706,14 @@ def _dcc_adjustments(comp):
             "units": unreal_offsets["units"],
         },
     }
+
+
+def _nuke_win_translate_to_film_offset_in(delta_win_translate, aperture_mm):
+    # Nuke win_translate is normalized to the aperture dimension.
+    # FBX FilmOffset is in inches, so:
+    #   film_offset_in = win_translate * aperture_in
+    aperture_in = aperture_mm * MM_TO_INCH
+    return delta_win_translate * aperture_in
 
 
 def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fbx):
@@ -717,8 +732,8 @@ def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fb
         "Scale:     {:.8f}".format(comp["scale"]),
         "",
         "Per-DCC adjustments:",
-        "  Nuke   -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
-            dcc["nuke"]["focal_old_mm"], dcc["nuke"]["focal_new_mm"], dcc["nuke"]["delta_x_in"], dcc["nuke"]["delta_y_in"]
+        "  Nuke   -> Focal: {:.6f} -> {:.6f} mm, win_translate delta: ({:.10f}, {:.10f}) normalized".format(
+            dcc["nuke"]["focal_old_mm"], dcc["nuke"]["focal_new_mm"], dcc["nuke"]["delta_x_win_translate"], dcc["nuke"]["delta_y_win_translate"]
         ),
         "  Maya   -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
             dcc["maya"]["focal_old_mm"], dcc["maya"]["focal_new_mm"], dcc["maya"]["delta_x_in"], dcc["maya"]["delta_y_in"]
