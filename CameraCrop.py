@@ -1,34 +1,7 @@
-# Nuke 14.1v5 / classic 3D Camera workflow
-#
-# Select exactly:
-#   - one Transform node
-#   - one Camera node
-#
-# Behavior:
-#   A) If the Camera is already reading from an ASCII FBX:
-#      - writes a sibling patched FBX
-#      - optionally repoints/reloads the selected Camera
-#
-#   B) If the Camera is NOT reading from a file:
-#      - prompts for a save path
-#      - exports a brand-new ASCII FBX via Scene + WriteGeo
-#      - if the camera is static, exports a single frame only
-#      - patches the exported FBX
-#      - creates a new imported Camera node in Nuke pointing at that FBX
-#
-# Mathematical scope:
-#   - uniform scale only
-#   - no rotate / skew
-#   - static Transform values
-#   - camera win_translate = 0,0 ; win_scale = 1,1 ; winroll = 0
-#
-# Units:
-#   - focal length in mm
-#   - film offsets in inches
-
-import nuke
 import os
 import re
+
+import nuke
 
 MM_TO_INCH = 0.0393701
 EPS = 1e-8
@@ -43,42 +16,38 @@ def _msg(text):
     print(text)
 
 
+def _ask(text):
+    return bool(nuke.ask(text))
+
+
 def _selected_transform_and_camera():
     sel = nuke.selectedNodes()
-    if len(sel) != 2:
-        raise ReframeBakeError(
-            "Select exactly 2 nodes:\n"
-            "  - one Transform\n"
-            "  - one Camera"
-        )
-
     transforms = [n for n in sel if n.Class() == "Transform"]
     cameras = [n for n in sel if n.Class().startswith("Camera")]
 
-    if len(transforms) != 1 or len(cameras) != 1:
+    if len(sel) != 2 or len(transforms) != 1 or len(cameras) != 1:
         raise ReframeBakeError(
-            "Selection must contain exactly:\n"
-            "  - one Transform node\n"
-            "  - one Camera/Camera2-style node"
+            "Select exactly two nodes:\n"
+            "  - one Transform\n"
+            "  - one Camera (classic 3D Camera/Camera2)"
         )
-
     return transforms[0], cameras[0]
 
 
-def _knob_xy(knob):
+def _knob_xy(knob, frame=None):
+    if frame is None:
+        try:
+            v = knob.value()
+            if isinstance(v, (list, tuple)) and len(v) >= 2:
+                return float(v[0]), float(v[1])
+        except Exception:
+            pass
     try:
-        v = knob.value()
-        if isinstance(v, (list, tuple)) and len(v) >= 2:
-            return float(v[0]), float(v[1])
+        if frame is None:
+            return float(knob.getValue(0)), float(knob.getValue(1))
+        return float(knob.valueAt(frame, 0)), float(knob.valueAt(frame, 1))
     except Exception:
-        pass
-
-    try:
-        return float(knob.getValue(0)), float(knob.getValue(1))
-    except Exception:
-        pass
-
-    raise ReframeBakeError("Could not read x/y values from knob '{}'".format(knob.name()))
+        raise ReframeBakeError("Failed to read x/y values from knob '{}'".format(knob.name()))
 
 
 def _is_animated(knob):
@@ -88,128 +57,113 @@ def _is_animated(knob):
         return False
 
 
-def _uniform_scale(scale_knob):
-    sx, sy = _knob_xy(scale_knob)
-    if abs(sx - sy) > 1e-6:
-        raise ReframeBakeError(
-            "Transform scale must be uniform.\n"
-            "Found scale.x = {:.10f}, scale.y = {:.10f}".format(sx, sy)
-        )
-    return float(sx)
-
-
-def _validate_transform(node):
-    for k in ("translate", "scale", "center"):
-        if k not in node.knobs():
-            raise ReframeBakeError("Transform is missing knob '{}'".format(k))
-        if _is_animated(node[k]):
-            raise ReframeBakeError(
-                "This script only supports static Transform values.\n"
-                "Knob '{}' is animated.".format(k)
-            )
-
-    if "rotate" in node.knobs():
-        rot = float(node["rotate"].value())
-        if abs(rot) > EPS:
-            raise ReframeBakeError("Transform rotate must be 0.")
-
-    for k in ("skewX", "skewY"):
-        if k in node.knobs() and abs(float(node[k].value())) > EPS:
-            raise ReframeBakeError("{} must be 0.".format(k))
-
-
-def _camera_is_reading_from_file(node):
-    if "read_from_file" not in node.knobs():
-        return False
-    try:
-        return bool(node["read_from_file"].value())
-    except Exception:
-        return False
+def _camera_is_reading_from_file(camera):
+    return "read_from_file" in camera.knobs() and bool(camera["read_from_file"].value())
 
 
 def _evaluate_file_knob(node, knob_name):
     if knob_name not in node.knobs():
-        raise ReframeBakeError("Node '{}' has no '{}' knob".format(node.name(), knob_name))
-
-    knob = node[knob_name]
+        return ""
+    k = node[knob_name]
     try:
-        path = knob.evaluate()
+        p = k.evaluate()
     except Exception:
-        path = knob.value()
-    return path or ""
+        p = k.value()
+    return (p or "").strip()
 
 
 def _is_ascii_fbx(path):
     with open(path, "rb") as fh:
-        header = fh.read(64)
-    return b"Kaydara FBX Binary" not in header
+        return b"Kaydara FBX Binary" not in fh.read(64)
 
 
-def _validate_camera_common(node):
-    for k in ("focal", "haperture", "vaperture"):
-        if k not in node.knobs():
-            raise ReframeBakeError(
-                "Camera node '{}' is missing required knob '{}'".format(node.name(), k)
-            )
+def _validate_transform(node):
+    required = ("translate", "center", "scale")
+    for name in required:
+        if name not in node.knobs():
+            raise ReframeBakeError("Transform is missing '{}' knob".format(name))
+        if _is_animated(node[name]):
+            raise ReframeBakeError("Animated Transform knobs are not supported: '{}'".format(name))
 
-    if "win_translate" in node.knobs():
-        wx, wy = _knob_xy(node["win_translate"])
+    if "rotate" in node.knobs() and abs(float(node["rotate"].value())) > EPS:
+        raise ReframeBakeError("Transform.rotate must be 0.")
+
+    for name in ("skewX", "skewY"):
+        if name in node.knobs() and abs(float(node[name].value())) > EPS:
+            raise ReframeBakeError("Transform.{} must be 0.".format(name))
+
+    sx, sy = _knob_xy(node["scale"])
+    if abs(sx - sy) > 1e-6:
+        raise ReframeBakeError("Transform scale must be uniform (scale.x == scale.y).")
+    if sx <= 0.0:
+        raise ReframeBakeError("Transform scale must be > 0.")
+
+
+def _validate_camera(camera):
+    for name in ("focal", "haperture", "vaperture"):
+        if name not in camera.knobs():
+            raise ReframeBakeError("Camera missing '{}' knob".format(name))
+
+    # Keep these strict to avoid double transforms.
+    if "win_translate" in camera.knobs():
+        wx, wy = _knob_xy(camera["win_translate"])
         if abs(wx) > EPS or abs(wy) > EPS:
-            raise ReframeBakeError(
-                "Camera win_translate must be 0,0.\n"
-                "Found ({:.10f}, {:.10f})".format(wx, wy)
-            )
-
-    if "win_scale" in node.knobs():
-        sx, sy = _knob_xy(node["win_scale"])
+            raise ReframeBakeError("Camera.win_translate must be 0,0.")
+    if "win_scale" in camera.knobs():
+        sx, sy = _knob_xy(camera["win_scale"])
         if abs(sx - 1.0) > EPS or abs(sy - 1.0) > EPS:
-            raise ReframeBakeError(
-                "Camera win_scale must be 1,1.\n"
-                "Found ({:.10f}, {:.10f})".format(sx, sy)
-            )
-
-    if "winroll" in node.knobs():
-        wr = float(node["winroll"].value())
-        if abs(wr) > EPS:
-            raise ReframeBakeError("Camera winroll must be 0.")
+            raise ReframeBakeError("Camera.win_scale must be 1,1.")
+    if "winroll" in camera.knobs() and abs(float(camera["winroll"].value())) > EPS:
+        raise ReframeBakeError("Camera.winroll must be 0.")
 
 
-def _validate_existing_fbx_camera(node):
-    _validate_camera_common(node)
-
-    if not _camera_is_reading_from_file(node):
-        raise ReframeBakeError("Camera is not set to 'read from file'.")
-
-    if "file" not in node.knobs():
-        raise ReframeBakeError("Camera node has no 'file' knob.")
-
-    path = _evaluate_file_knob(node, "file")
-    if not path:
-        raise ReframeBakeError("Camera file path is empty.")
-    if not path.lower().endswith(".fbx"):
-        raise ReframeBakeError("Camera file must be an .fbx:\n{}".format(path))
-    if not os.path.exists(path):
-        raise ReframeBakeError("FBX file does not exist:\n{}".format(path))
-    if not _is_ascii_fbx(path):
-        raise ReframeBakeError("FBX is binary. This script edits ASCII FBX only:\n{}".format(path))
-    return path
 
 
-def _camera_is_static_in_nuke(camera):
-    """
-    Conservative static check for a native Nuke camera.
-    If any common transform / lens knob is animated, treat it as animated.
-    """
-    knobs_to_check = [
-        "translate", "rotate", "scaling", "uniform_scale", "skew", "pivot",
-        "focal", "haperture", "vaperture", "near", "far",
-        "win_translate", "win_scale", "winroll"
-    ]
-    for k in knobs_to_check:
-        if k in camera.knobs():
-            if _is_animated(camera[k]):
-                return False
-    return True
+def _to_nuke_path(path):
+    # Nuke file knobs are safest with POSIX separators on all platforms.
+    return os.path.abspath(path).replace("\\", "/")
+
+def _script_dir_default():
+    script_path = nuke.root().name()
+    if script_path and script_path != "Root":
+        return os.path.dirname(script_path)
+    return os.path.expanduser("~")
+
+
+def _default_output_dir(camera):
+    if _camera_is_reading_from_file(camera):
+        src = _evaluate_file_knob(camera, "file")
+        if src:
+            return os.path.dirname(src)
+    return _script_dir_default()
+
+
+def _ask_output_folder(default_dir):
+    chosen = nuke.getFilename("Choose output folder", "*", os.path.join(default_dir, "select_folder"))
+    if not chosen:
+        return ""
+    chosen = _to_nuke_path(chosen)
+    if os.path.isfile(chosen):
+        chosen = os.path.dirname(chosen)
+    if not os.path.exists(chosen):
+        os.makedirs(chosen)
+    return chosen
+
+
+def _ask_output_plan(default_dir, default_base):
+    out_dir = _ask_output_folder(default_dir)
+    if not out_dir:
+        return "", ""
+
+    base = nuke.getInput("Base output name (example: Camera_30)", default_base)
+    if base is None:
+        return "", ""
+
+    base = re.sub(r"[^0-9A-Za-z._-]+", "_", base).strip("_")
+    if not base:
+        raise ReframeBakeError("Base output name cannot be empty.")
+
+    return out_dir, base
 
 
 def _read_text(path):
@@ -222,26 +176,24 @@ def _write_text(path, text):
         fh.write(text)
 
 
-def _find_matching_brace(text, open_brace_idx):
-    """
-    Brace matcher that ignores braces inside quoted strings.
-    """
+def _base_name(name):
+    return name.split(":")[-1].split("|")[-1].strip()
+
+
+def _find_matching_brace(text, open_idx):
     depth = 0
     in_string = False
-    escaped = False
-
-    for i in range(open_brace_idx, len(text)):
+    esc = False
+    for i in range(open_idx, len(text)):
         ch = text[i]
-
         if in_string:
-            if escaped:
-                escaped = False
+            if esc:
+                esc = False
             elif ch == "\\":
-                escaped = True
+                esc = True
             elif ch == '"':
                 in_string = False
             continue
-
         if ch == '"':
             in_string = True
         elif ch == "{":
@@ -250,667 +202,584 @@ def _find_matching_brace(text, open_brace_idx):
             depth -= 1
             if depth == 0:
                 return i
-
-    raise ReframeBakeError("Could not find matching brace in FBX text.")
-
-
-def _base_name(name):
-    s = name.split(":")[-1]
-    s = s.split("|")[-1]
-    return s.strip()
+    raise ReframeBakeError("Malformed FBX: unmatched braces.")
 
 
 def _fbx_objects(text):
-    objs = {
-        "models": [],
-        "camera_attrs": [],
-        "curve_nodes": [],
-        "curves": [],
+    specs = {
+        "models": re.compile(r'Model:\s*(\d+)\s*,\s*"Model::([^"]+)"\s*,\s*"Camera"\s*\{', re.MULTILINE),
+        "attrs": re.compile(r'NodeAttribute:\s*(\d+)\s*,\s*"NodeAttribute::([^"]+)"\s*,\s*"Camera"\s*\{', re.MULTILINE),
+        "curve_nodes": re.compile(r'AnimationCurveNode:\s*(\d+)\s*,\s*"([^"]+)"\s*,\s*""\s*\{', re.MULTILINE),
+        "curves": re.compile(r'AnimationCurve:\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*""\s*\{', re.MULTILINE),
     }
-
-    specs = [
-        ("models", re.compile(
-            r'Model:\s*(\d+)\s*,\s*"Model::([^"]+)"\s*,\s*"Camera"\s*\{',
-            re.MULTILINE
-        )),
-        ("camera_attrs", re.compile(
-            r'NodeAttribute:\s*(\d+)\s*,\s*"NodeAttribute::([^"]+)"\s*,\s*"Camera"\s*\{',
-            re.MULTILINE
-        )),
-        ("curve_nodes", re.compile(
-            r'AnimationCurveNode:\s*(\d+)\s*,\s*"([^"]+)"\s*,\s*""\s*\{',
-            re.MULTILINE
-        )),
-        ("curves", re.compile(
-            r'AnimationCurve:\s*(\d+)\s*,\s*"([^"]*)"\s*,\s*""\s*\{',
-            re.MULTILINE
-        )),
-    ]
-
-    for key, pat in specs:
+    out = {k: [] for k in specs}
+    for key, pat in specs.items():
         for m in pat.finditer(text):
-            obj_id = int(m.group(1))
-            name = m.group(2)
-            open_brace = text.find("{", m.start())
-            close_brace = _find_matching_brace(text, open_brace)
-            objs[key].append({
-                "id": obj_id,
-                "name": name,
+            open_idx = text.find("{", m.start())
+            close_idx = _find_matching_brace(text, open_idx)
+            out[key].append({
+                "id": int(m.group(1)),
+                "name": m.group(2),
                 "start": m.start(),
-                "end": close_brace + 1,
-                "text": text[m.start():close_brace + 1],
+                "end": close_idx + 1,
+                "text": text[m.start():close_idx + 1],
             })
-
-    return objs
+    return out
 
 
 def _fbx_connections(text):
     oo = []
     op = []
-
-    oo_pat = re.compile(r'C:\s*"OO"\s*,\s*(-?\d+)\s*,\s*(-?\d+)', re.MULTILINE)
-    op_pat = re.compile(
-        r'C:\s*"OP"\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*"([^"]+)"',
-        re.MULTILINE
-    )
-
-    for m in oo_pat.finditer(text):
+    for m in re.finditer(r'C:\s*"OO"\s*,\s*(-?\d+)\s*,\s*(-?\d+)', text, re.MULTILINE):
         oo.append((int(m.group(1)), int(m.group(2))))
-
-    for m in op_pat.finditer(text):
+    for m in re.finditer(r'C:\s*"OP"\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*"([^"]+)"', text, re.MULTILINE):
         op.append((int(m.group(1)), int(m.group(2)), m.group(3)))
-
     return oo, op
 
 
-def _choose_by_name(items, target_name, kind_label):
-    if not items:
-        raise ReframeBakeError("No {} objects found.".format(kind_label))
-
-    exact = [x for x in items if x["name"] == target_name]
+def _choose_by_name(items, target, label):
+    exact = [x for x in items if x["name"] == target]
     if len(exact) == 1:
         return exact[0]
-
-    base = _base_name(target_name)
+    base = _base_name(target)
     loose = [x for x in items if _base_name(x["name"]) == base]
     if len(loose) == 1:
         return loose[0]
-
-    names = "\n".join("  - {}".format(x["name"]) for x in items)
-    raise ReframeBakeError(
-        "Could not uniquely resolve {} '{}'. Available:\n{}".format(
-            kind_label, target_name, names
-        )
-    )
+    raise ReframeBakeError("Could not uniquely resolve {} '{}'".format(label, target))
 
 
-def _resolve_camera_attribute_for_model(fbx_text, target_model_name):
-    objs = _fbx_objects(fbx_text)
-    oo_conns, _ = _fbx_connections(fbx_text)
+def _resolve_camera_blocks(text, target_model_name):
+    objs = _fbx_objects(text)
+    oo, _ = _fbx_connections(text)
+
+    if not objs["models"]:
+        raise ReframeBakeError("No FBX camera Model objects found.")
+    if not objs["attrs"]:
+        raise ReframeBakeError("No FBX camera NodeAttribute objects found.")
 
     model = _choose_by_name(objs["models"], target_model_name, "camera model")
-    attr_by_id = {x["id"]: x for x in objs["camera_attrs"]}
-
-    matched_attrs = []
-    for a, b in oo_conns:
-        if a in attr_by_id and b == model["id"]:
-            matched_attrs.append(attr_by_id[a])
-        elif b in attr_by_id and a == model["id"]:
-            matched_attrs.append(attr_by_id[b])
-
-    matched_attrs = list({x["id"]: x for x in matched_attrs}.values())
-
-    if len(matched_attrs) != 1:
-        names = [x["name"] for x in matched_attrs]
-        raise ReframeBakeError(
-            "Could not uniquely resolve the camera attribute connected to model '{}'. "
-            "Matched attributes: {}".format(target_model_name, names)
-        )
-
-    return model, matched_attrs[0]
+    attrs_by_id = {x["id"]: x for x in objs["attrs"]}
+    matched = []
+    for a, b in oo:
+        if a in attrs_by_id and b == model["id"]:
+            matched.append(attrs_by_id[a])
+        elif b in attrs_by_id and a == model["id"]:
+            matched.append(attrs_by_id[b])
+    matched = list({x["id"]: x for x in matched}.values())
+    if len(matched) != 1:
+        raise ReframeBakeError("Could not uniquely find camera attribute linked to model '{}'".format(model["name"]))
+    return objs, model, matched[0]
 
 
-def _get_property(block_text, prop_name, default=None):
-    pattern = re.compile(
-        r'^[ \t]*P:\s*"' + re.escape(prop_name) + r'"\s*,.*?,.*?,.*?,\s*([-+0-9.eE]+)',
-        re.MULTILINE
-    )
-    m = pattern.search(block_text)
+def _get_prop(text, name, default=None):
+    m = re.search(r'^[ \t]*P:\s*"{}"\s*,.*?,.*?,.*?,\s*([-+0-9.eE]+)'.format(re.escape(name)), text, re.MULTILINE)
+    return float(m.group(1)) if m else default
+
+
+def _set_existing_prop(text, name, value):
+    val = "{:.15g}".format(float(value))
+    pat = re.compile(r'(^[ \t]*P:\s*"' + re.escape(name) + r'"\s*,.*?,.*?,.*?,\s*)([-+0-9.eE]+)([^\n]*$)', re.MULTILINE)
+    if not pat.search(text):
+        return text
+    return pat.sub(lambda m: "{}{}{}".format(m.group(1), val, m.group(3)), text, count=1)
+
+
+def _parse_float_array_block(array_text):
+    tokens = [v.strip() for v in array_text.split(",") if v.strip()]
+    if not tokens:
+        return []
+    out = []
+    for v in tokens:
+        try:
+            out.append(float(v))
+        except Exception:
+            # If parsing is ambiguous, do not rewrite this block.
+            return None
+    return out
+
+
+def _replace_array_values(block_text, key_name, xform):
+    pat = re.compile(r'(' + re.escape(key_name) + r':\s*\*)(\d+)(\s*\{\s*a:\s*)([^}]*)((\s*)\})', re.MULTILINE | re.DOTALL)
+    m = pat.search(block_text)
     if not m:
-        return default
-    return float(m.group(1))
+        return block_text
+    vals = _parse_float_array_block(m.group(4))
+    if vals is None:
+        return block_text
+    new_vals = ["{:.15g}".format(xform(v)) for v in vals]
+    # Keep original count token untouched to avoid structural corruption.
+    return pat.sub(r"\g<1>{}\g<3>{}\g<5>".format(m.group(2), ",".join(new_vals)), block_text, count=1)
 
 
-def _set_existing_property_only(block_text, prop_name, value):
-    value_str = "{:.15g}".format(float(value))
-    pat = re.compile(
-        r'(^[ \t]*P:\s*"' + re.escape(prop_name) + r'"\s*,.*?,.*?,.*?,\s*)([-+0-9.eE]+)([^\n]*$)',
-        re.MULTILINE
-    )
-    if pat.search(block_text):
-        return pat.sub(r"\1" + value_str + r"\3", block_text, count=1)
-    return block_text
-
-
-def _set_anim_curve_values(curve_block_text, new_value):
-    value_str = "{:.15g}".format(float(new_value))
-
-    curve_block_text = re.sub(
-        r'(^[ \t]*Default:\s*)([-+0-9.eE]+)',
-        r"\1" + value_str,
-        curve_block_text,
-        count=1,
-        flags=re.MULTILINE
-    )
-
-    def _replace_array(match):
-        count = int(match.group(2))
-        values = ",".join([value_str] * count)
-        return "{}{}{}{}{}".format(
-            match.group(1), count, match.group(3), values, match.group(5)
+def _patch_curve_block(curve_text, op):
+    m = re.search(r'^[ \t]*Default:\s*([-+0-9.eE]+)', curve_text, re.MULTILINE)
+    if m:
+        old = float(m.group(1))
+        new = op(old)
+        curve_text = re.sub(
+            r'(^[ \t]*Default:\s*)([-+0-9.eE]+)',
+            lambda m: "{}{}".format(m.group(1), "{:.15g}".format(new)),
+            curve_text,
+            count=1,
+            flags=re.MULTILINE,
         )
-
-    curve_block_text = re.sub(
-        r'(KeyValueFloat:\s*\*)(\d+)(\s*\{\s*a:\s*)([^}]*)((\s*)\})',
-        _replace_array,
-        curve_block_text,
-        count=1,
-        flags=re.MULTILINE | re.DOTALL
-    )
-
-    curve_block_text = re.sub(
-        r'(KeyValueDouble:\s*\*)(\d+)(\s*\{\s*a:\s*)([^}]*)((\s*)\})',
-        _replace_array,
-        curve_block_text,
-        count=1,
-        flags=re.MULTILINE | re.DOTALL
-    )
-
-    return curve_block_text
+    curve_text = _replace_array_values(curve_text, "KeyValueFloat", op)
+    curve_text = _replace_array_values(curve_text, "KeyValueDouble", op)
+    return curve_text
 
 
-def _get_effective_property_value(fbx_text, target_model_name, property_name, fallback=0.0):
-    """
-    Reads the current effective value in order of precedence:
-      1) connected AnimationCurve Default
-      2) connected AnimationCurveNode d|prop
-      3) NodeAttribute prop
-      4) fallback
-    """
-    model_obj, attr_obj = _resolve_camera_attribute_for_model(fbx_text, target_model_name)
-    objs = _fbx_objects(fbx_text)
-    _, op_conns = _fbx_connections(fbx_text)
-
-    curve_nodes_by_id = {x["id"]: x for x in objs["curve_nodes"]}
-    curves_by_id = {x["id"]: x for x in objs["curves"]}
-
-    curve_node_obj = None
-    for src_id, dst_id, prop_name in op_conns:
-        if dst_id == attr_obj["id"] and prop_name == property_name and src_id in curve_nodes_by_id:
-            curve_node_obj = curve_nodes_by_id[src_id]
-            break
-
-    if curve_node_obj is not None:
-        curve_obj = None
-        wanted = "d|" + property_name
-        for src_id, dst_id, prop_name in op_conns:
-            if dst_id == curve_node_obj["id"] and prop_name == wanted and src_id in curves_by_id:
-                curve_obj = curves_by_id[src_id]
-                break
-
-        if curve_obj is not None:
-            m = re.search(r'^[ \t]*Default:\s*([-+0-9.eE]+)', curve_obj["text"], re.MULTILINE)
-            if m:
-                return float(m.group(1))
-
-        val = _get_property(curve_node_obj["text"], "d|" + property_name, None)
-        if val is not None:
-            return val
-
-    val = _get_property(attr_obj["text"], property_name, None)
-    if val is not None:
-        return val
-
-    return fallback
-
-
-def _patch_one_camera_property(full_text, target_model_name, property_name, new_value):
-    """
-    Patches:
-      - NodeAttribute prop, if present
-      - connected AnimationCurveNode d|prop, if present
-      - connected AnimationCurve Default and KeyValue arrays, if present
-    """
-    model_obj, attr_obj = _resolve_camera_attribute_for_model(full_text, target_model_name)
-    objs = _fbx_objects(full_text)
+def _patch_property_everywhere(full_text, target_model_name, property_name, op):
+    objs, _, attr = _resolve_camera_blocks(full_text, target_model_name)
     _, op_conns = _fbx_connections(full_text)
-
-    curve_nodes_by_id = {x["id"]: x for x in objs["curve_nodes"]}
-    curves_by_id = {x["id"]: x for x in objs["curves"]}
+    curve_nodes = {x["id"]: x for x in objs["curve_nodes"]}
+    curves = {x["id"]: x for x in objs["curves"]}
 
     replacements = []
 
-    attr_text_new = _set_existing_property_only(attr_obj["text"], property_name, new_value)
-    if attr_text_new != attr_obj["text"]:
-        replacements.append((attr_obj["start"], attr_obj["end"], attr_text_new))
+    old_attr_val = _get_prop(attr["text"], property_name, None)
+    if old_attr_val is not None:
+        replacements.append((attr["start"], attr["end"], _set_existing_prop(attr["text"], property_name, op(old_attr_val))))
 
-    curve_node_obj = None
+    curve_node = None
     for src_id, dst_id, prop_name in op_conns:
-        if dst_id == attr_obj["id"] and prop_name == property_name and src_id in curve_nodes_by_id:
-            curve_node_obj = curve_nodes_by_id[src_id]
+        if dst_id == attr["id"] and prop_name == property_name and src_id in curve_nodes:
+            curve_node = curve_nodes[src_id]
             break
 
-    if curve_node_obj is not None:
-        cn_text_new = _set_existing_property_only(curve_node_obj["text"], "d|" + property_name, new_value)
-        if cn_text_new != curve_node_obj["text"]:
-            replacements.append((curve_node_obj["start"], curve_node_obj["end"], cn_text_new))
+    if curve_node is not None:
+        old_d = _get_prop(curve_node["text"], "d|" + property_name, None)
+        if old_d is not None:
+            replacements.append((curve_node["start"], curve_node["end"], _set_existing_prop(curve_node["text"], "d|" + property_name, op(old_d))))
 
         curve_obj = None
-        wanted = "d|" + property_name
+        want = "d|" + property_name
         for src_id, dst_id, prop_name in op_conns:
-            if dst_id == curve_node_obj["id"] and prop_name == wanted and src_id in curves_by_id:
-                curve_obj = curves_by_id[src_id]
+            if dst_id == curve_node["id"] and prop_name == want and src_id in curves:
+                curve_obj = curves[src_id]
+                break
+        if curve_obj is not None:
+            replacements.append((curve_obj["start"], curve_obj["end"], _patch_curve_block(curve_obj["text"], op)))
+
+    for s, e, r in sorted(replacements, key=lambda x: x[0], reverse=True):
+        full_text = full_text[:s] + r + full_text[e:]
+    return full_text
+
+
+def _camera_property_curve_links(full_text, target_model_name, property_name):
+    objs, _, attr = _resolve_camera_blocks(full_text, target_model_name)
+    _, op_conns = _fbx_connections(full_text)
+    curve_nodes = {x["id"]: x for x in objs["curve_nodes"]}
+    curves = {x["id"]: x for x in objs["curves"]}
+
+    curve_node_id = None
+    curve_id = None
+
+    for src_id, dst_id, prop_name in op_conns:
+        if dst_id == attr["id"] and prop_name == property_name and src_id in curve_nodes:
+            curve_node_id = src_id
+            break
+
+    if curve_node_id is not None:
+        want = "d|" + property_name
+        for src_id, dst_id, prop_name in op_conns:
+            if dst_id == curve_node_id and prop_name == want and src_id in curves:
+                curve_id = src_id
                 break
 
-        if curve_obj is not None:
-            c_text_new = _set_anim_curve_values(curve_obj["text"], new_value)
-            if c_text_new != curve_obj["text"]:
-                replacements.append((curve_obj["start"], curve_obj["end"], c_text_new))
+    return attr["id"], curve_node_id, curve_id
 
-    for start, end, repl in sorted(replacements, key=lambda x: x[0], reverse=True):
-        full_text = full_text[:start] + repl + full_text[end:]
+
+def _camera_property_has_animation(full_text, target_model_name, property_name):
+    _, curve_node_id, curve_id = _camera_property_curve_links(full_text, target_model_name, property_name)
+    return curve_node_id is not None or curve_id is not None
+
+
+def _remove_camera_property_animation_links(full_text, target_model_name, property_name):
+    attr_id, curve_node_id, curve_id = _camera_property_curve_links(full_text, target_model_name, property_name)
+    if curve_node_id is None:
+        return full_text
+
+    pat_attr = re.compile(
+        r'^\s*C:\s*"OP"\s*,\s*{}\s*,\s*{}\s*,\s*"{}"\s*\r?\n?'.format(curve_node_id, attr_id, re.escape(property_name)),
+        re.MULTILINE,
+    )
+    full_text = pat_attr.sub("", full_text)
+
+    if curve_id is not None:
+        pat_curve = re.compile(
+            r'^\s*C:\s*"OP"\s*,\s*{}\s*,\s*{}\s*,\s*"{}"\s*\r?\n?'.format(curve_id, curve_node_id, re.escape("d|" + property_name)),
+            re.MULTILINE,
+        )
+        full_text = pat_curve.sub("", full_text)
 
     return full_text
 
 
-def _unique_output_path(src_path, suffix="_nukeReframe"):
-    base, ext = os.path.splitext(src_path)
-    candidate = base + suffix + ext
-    if not os.path.exists(candidate):
-        return candidate
-
-    i = 1
-    while True:
-        candidate = "{}{}_{:02d}{}".format(base, suffix, i, ext)
-        if not os.path.exists(candidate):
-            return candidate
-        i += 1
+def _force_static_camera_properties(full_text, target_model_name, properties):
+    for prop in properties:
+        full_text = _remove_camera_property_animation_links(full_text, target_model_name, prop)
+    return full_text
 
 
-def _set_choice_knob_exact(node, knob_name, wanted):
-    if knob_name not in node.knobs():
-        return False
+def _set_global_settings_for_dcc(text, dcc):
+    if dcc == "maya":
+        axis = {"UpAxis": 1, "UpAxisSign": 1, "FrontAxis": 2, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
+    elif dcc == "unreal":
+        axis = {"UpAxis": 2, "UpAxisSign": 1, "FrontAxis": 1, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
+    else:  # nuke
+        axis = {"UpAxis": 1, "UpAxisSign": 1, "FrontAxis": 2, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
 
-    knob = node[knob_name]
+    for k, v in axis.items():
+        text = re.sub(
+            r'(P:\s*"{}"\s*,\s*"int"\s*,\s*"Integer"\s*,\s*""\s*,\s*)([-+0-9.eE]+)'.format(re.escape(k)),
+            lambda m, _v=v: "{}{}".format(m.group(1), _v),
+            text,
+        )
 
-    try:
-        vals = list(knob.values())
-        if wanted in vals:
-            knob.setValue(vals.index(wanted))
-            return True
-    except Exception:
-        pass
-
-    try:
-        knob.setValue(wanted)
-        return True
-    except Exception:
-        return False
-
-
-def _reload_camera_from_file(camera_node, file_path, target_name=None):
-    if "read_from_file" in camera_node.knobs():
-        camera_node["read_from_file"].setValue(True)
-
-    if "file" not in camera_node.knobs():
-        raise ReframeBakeError("Camera node '{}' has no file knob.".format(camera_node.name()))
-
-    camera_node["file"].setValue(file_path)
-
-    if "reload" in camera_node.knobs():
-        try:
-            camera_node["reload"].execute()
-        except Exception:
-            try:
-                nuke.executeInMainThread(camera_node["reload"].execute)
-            except Exception:
-                pass
-
-    if target_name and "fbx_node_name" in camera_node.knobs():
-        _set_choice_knob_exact(camera_node, "fbx_node_name", target_name)
-        if "reload" in camera_node.knobs():
-            try:
-                camera_node["reload"].execute()
-            except Exception:
-                try:
-                    nuke.executeInMainThread(camera_node["reload"].execute)
-                except Exception:
-                    pass
+    # Normalize unit to centimeters where possible.
+    text = re.sub(r'(P:\s*"UnitScaleFactor"\s*,\s*"double"\s*,\s*"Number"\s*,\s*""\s*,\s*)([-+0-9.eE]+)', r"\g<1>100", text)
+    text = re.sub(r'(P:\s*"OriginalUnitScaleFactor"\s*,\s*"double"\s*,\s*"Number"\s*,\s*""\s*,\s*)([-+0-9.eE]+)', r"\g<1>100", text)
+    return text
 
 
-def _create_imported_camera(file_path, target_name=None, ref_node=None):
-    try:
-        cam = nuke.nodes.Camera2()
-    except Exception:
-        cam = nuke.nodes.Camera()
-
-    if ref_node is not None:
-        try:
-            cam.setXpos(ref_node.xpos() + 140)
-            cam.setYpos(ref_node.ypos())
-        except Exception:
-            pass
-
-    try:
-        cam.setName((ref_node.name() if ref_node else "Camera") + "_FBX")
-    except Exception:
-        pass
-
-    _reload_camera_from_file(cam, file_path, target_name=target_name)
-    return cam
-
-
-def _ask_save_fbx_path(camera_node):
-    script_path = nuke.root().name()
-    if script_path and script_path != "Root":
-        base_dir = os.path.dirname(script_path)
-    else:
-        base_dir = os.path.expanduser("~")
-
-    default_name = camera_node.name() + "_nukeReframe_clean.fbx"
-    default_path = os.path.join(base_dir, default_name)
-
-    path = nuke.getFilename("Save ASCII FBX camera as", "*.fbx", default_path)
-    if not path:
-        return ""
-
-    if not path.lower().endswith(".fbx"):
-        path += ".fbx"
-
-    return path
-
-
-def _export_camera_to_new_ascii_fbx(camera_node, out_path, single_frame=False):
-    temp_scene = None
-    temp_writegeo = None
-    try:
-        temp_scene = nuke.nodes.Scene(inputs=[camera_node])
-        temp_writegeo = nuke.nodes.WriteGeo(inputs=[temp_scene])
-
-        temp_writegeo["file"].setValue(out_path)
-
-        if "file_type" in temp_writegeo.knobs():
-            try:
-                temp_writegeo["file_type"].setValue("fbx")
-            except Exception:
-                try:
-                    temp_writegeo["file_type"].setValue(1)
-                except Exception:
-                    pass
-
-        if "writeCameras" in temp_writegeo.knobs():
-            temp_writegeo["writeCameras"].setValue(True)
-        if "writeGeometries" in temp_writegeo.knobs():
-            temp_writegeo["writeGeometries"].setValue(False)
-        if "writeLights" in temp_writegeo.knobs():
-            temp_writegeo["writeLights"].setValue(False)
-        if "writeAxes" in temp_writegeo.knobs():
-            temp_writegeo["writeAxes"].setValue(False)
-        if "writePointClouds" in temp_writegeo.knobs():
-            temp_writegeo["writePointClouds"].setValue(False)
-        if "asciiFileFormat" in temp_writegeo.knobs():
-            temp_writegeo["asciiFileFormat"].setValue(True)
-
-        if single_frame:
-            frame = int(nuke.frame())
-            nuke.execute(temp_writegeo.name(), frame, frame)
-        else:
-            first = int(nuke.root()["first_frame"].value())
-            last = int(nuke.root()["last_frame"].value())
-            nuke.execute(temp_writegeo.name(), first, last)
-
-    finally:
-        for node in (temp_writegeo, temp_scene):
-            if node is not None:
-                try:
-                    nuke.delete(node)
-                except Exception:
-                    pass
-
-
-def _compute_reframe_values(transform, camera):
+def _compute_reframe(transform, camera):
     tx, ty = _knob_xy(transform["translate"])
     cx, cy = _knob_xy(transform["center"])
-    scale = _uniform_scale(transform["scale"])
+    sx, sy = _knob_xy(transform["scale"])
+    if abs(sx - sy) > 1e-6:
+        raise ReframeBakeError("Transform scale must be uniform.")
+    scale = sx
+    if scale <= 0:
+        raise ReframeBakeError("Transform scale must be > 0.")
 
     fmt = transform.input(0).format() if transform.input(0) else nuke.root().format()
-    frame_w = float(fmt.width())
-    frame_h = float(fmt.height())
-
+    frame_w, frame_h = float(fmt.width()), float(fmt.height())
     if frame_w <= 0 or frame_h <= 0:
-        raise ReframeBakeError("Invalid frame format size.")
+        raise ReframeBakeError("Invalid frame format.")
 
     sensor_w_mm = float(camera["haperture"].value())
     sensor_h_mm = float(camera["vaperture"].value())
     focal_mm = float(camera["focal"].value())
 
-    shift_x_px = tx + (1.0 - scale) * (cx - frame_w / 2.0)
-    shift_y_px = ty + (1.0 - scale) * (cy - frame_h / 2.0)
-
-    delta_hfo_in = (shift_x_px / frame_w) * (sensor_w_mm * MM_TO_INCH)
-    delta_vfo_in = (shift_y_px / frame_h) * (sensor_h_mm * MM_TO_INCH)
-    new_focal_mm = scale * focal_mm
+    shift_x_px = tx + (1.0 - scale) * (cx - frame_w * 0.5)
+    shift_y_px = ty + (1.0 - scale) * (cy - frame_h * 0.5)
 
     return {
-        "tx": tx, "ty": ty,
-        "cx": cx, "cy": cy,
+        "tx": tx,
+        "ty": ty,
+        "cx": cx,
+        "cy": cy,
         "scale": scale,
-        "frame_w": frame_w, "frame_h": frame_h,
-        "sensor_w_mm": sensor_w_mm, "sensor_h_mm": sensor_h_mm,
+        "frame_w": frame_w,
+        "frame_h": frame_h,
+        "sensor_w_mm": sensor_w_mm,
+        "sensor_h_mm": sensor_h_mm,
         "focal_mm": focal_mm,
-        "delta_hfo_in": delta_hfo_in,
-        "delta_vfo_in": delta_vfo_in,
-        "new_focal_mm": new_focal_mm,
+        "shift_x_px": shift_x_px,
+        "shift_y_px": shift_y_px,
+        "delta_u": (shift_x_px / frame_w),
+        "delta_v": (shift_y_px / frame_h),
+        "delta_hfo_in": (shift_x_px / frame_w) * (sensor_w_mm * MM_TO_INCH),
+        "delta_vfo_in": (shift_y_px / frame_h) * (sensor_h_mm * MM_TO_INCH),
     }
 
 
-def _patch_fbx_camera_for_model(src_fbx, target_model_name,
-                                delta_hfo_in, delta_vfo_in, new_focal_mm,
-                                out_fbx=None):
-    fbx_text = _read_text(src_fbx)
+def _export_camera_to_ascii_fbx(camera_node, out_path, static_only):
+    temp_scene = None
+    temp_write = None
+    try:
+        temp_scene = nuke.nodes.Scene(inputs=[camera_node])
+        temp_write = nuke.nodes.WriteGeo(inputs=[temp_scene])
+        temp_write["file"].setValue(_to_nuke_path(out_path))
 
-    # Read current effective offsets from the file, not just the NodeAttribute,
-    # so that existing keyed/default values are composed correctly.
-    old_hfo = _get_effective_property_value(fbx_text, target_model_name, "FilmOffsetX", fallback=0.0)
-    old_vfo = _get_effective_property_value(fbx_text, target_model_name, "FilmOffsetY", fallback=0.0)
+        if "file_type" in temp_write.knobs():
+            try:
+                temp_write["file_type"].setValue("fbx")
+            except Exception:
+                pass
 
-    final_hfo = old_hfo + delta_hfo_in
-    final_vfo = old_vfo + delta_vfo_in
+        for knob, val in (("writeCameras", True), ("writeGeometries", False), ("writeLights", False),
+                          ("writeAxes", False), ("writePointClouds", False), ("asciiFileFormat", True)):
+            if knob in temp_write.knobs():
+                temp_write[knob].setValue(val)
 
-    fbx_text = _patch_one_camera_property(fbx_text, target_model_name, "FocalLength", new_focal_mm)
-    fbx_text = _patch_one_camera_property(fbx_text, target_model_name, "FilmOffsetX", final_hfo)
-    fbx_text = _patch_one_camera_property(fbx_text, target_model_name, "FilmOffsetY", final_vfo)
+        if static_only:
+            fr = int(nuke.frame())
+            nuke.execute(temp_write.name(), fr, fr)
+        else:
+            first = int(nuke.root()["first_frame"].value())
+            last = int(nuke.root()["last_frame"].value())
+            nuke.execute(temp_write.name(), first, last)
+    finally:
+        for n in (temp_write, temp_scene):
+            if n is not None:
+                try:
+                    nuke.delete(n)
+                except Exception:
+                    pass
 
-    model_obj, attr_obj = _resolve_camera_attribute_for_model(fbx_text, target_model_name)
 
-    if out_fbx is None:
-        out_fbx = _unique_output_path(src_fbx, suffix="_nukeReframe")
+def _camera_is_static_in_nuke(camera):
+    knobs = ["translate", "rotate", "scaling", "uniform_scale", "pivot", "focal", "haperture", "vaperture"]
+    for k in knobs:
+        if k in camera.knobs() and _is_animated(camera[k]):
+            return False
+    return True
 
-    _write_text(out_fbx, fbx_text)
 
+def _new_output_names(base_name):
+    clean = re.sub(r"[^0-9A-Za-z._-]+", "_", base_name).strip("_") or "camera"
     return {
-        "out_fbx": out_fbx,
-        "target_model_name": model_obj["name"],
-        "target_attr_name": attr_obj["name"],
-        "final_hfo": final_hfo,
-        "final_vfo": final_vfo,
-        "new_focal_mm": new_focal_mm,
+        "nuke": clean + "_nuke.fbx",
+        "maya": clean + "_maya.fbx",
+        "unreal": clean + "_unreal.fbx",
     }
 
 
-def _report_text(mode_label, transform, camera, comp, path_hint, target_name, extra=""):
+def _resolve_target_model_name(camera):
+    if "fbx_node_name" in camera.knobs():
+        try:
+            s = str(camera["fbx_node_name"].value()).strip()
+            if s:
+                return s
+        except Exception:
+            pass
+    return camera.name()
+
+
+def _confirm_overwrite(paths):
+    existing = [p for p in paths if os.path.exists(p)]
+    if not existing:
+        return True
+    return _ask("The following files already exist and will be overwritten:\n\n{}\n\nContinue?".format("\n".join(existing)))
+
+
+def _create_imported_camera(file_path, target_name, ref_node):
+    cam = nuke.nodes.Camera2()
+    try:
+        cam.setName(ref_node.name() + "_reframed")
+    except Exception:
+        pass
+    try:
+        cam.setXpos(ref_node.xpos() + 160)
+        cam.setYpos(ref_node.ypos())
+    except Exception:
+        pass
+
+    if "read_from_file" in cam.knobs():
+        cam["read_from_file"].setValue(True)
+    cam["file"].setValue(_to_nuke_path(file_path))
+    if "reload" in cam.knobs():
+        try:
+            cam["reload"].execute()
+        except Exception:
+            pass
+    if target_name and "fbx_node_name" in cam.knobs():
+        try:
+            vals = list(cam["fbx_node_name"].values())
+            if target_name in vals:
+                cam["fbx_node_name"].setValue(vals.index(target_name))
+        except Exception:
+            try:
+                cam["fbx_node_name"].setValue(target_name)
+            except Exception:
+                pass
+    return cam
+
+
+
+
+def _patch_property_static(full_text, target_model_name, property_name, op):
+    objs, _, attr = _resolve_camera_blocks(full_text, target_model_name)
+    old_val = _get_prop(attr["text"], property_name, 0.0)
+    new_val = op(old_val)
+
+    attr_new = _set_existing_prop(attr["text"], property_name, new_val)
+    if attr_new != attr["text"]:
+        full_text = full_text[:attr["start"]] + attr_new + full_text[attr["end"]:]
+
+    full_text = _remove_camera_property_animation_links(full_text, target_model_name, property_name)
+    return full_text
+
+
+def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=False):
+    scale = comp["scale"]
+    text = source_text
+
+    if force_static:
+        apply_prop = lambda t, p, fn: _patch_property_static(t, target_model_name, p, fn)
+    else:
+        apply_prop = lambda t, p, fn: _patch_property_everywhere(t, target_model_name, p, fn)
+
+    text = apply_prop(text, "FocalLength", lambda old: old * scale)
+
+    if dcc == "nuke":
+        # Nuke import maps FBX FilmOffsetX/Y to win_translate u/v.
+        dx = comp["delta_hfo_in"]
+        dy = comp["delta_vfo_in"]
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
+
+    elif dcc == "maya":
+        dx = comp["delta_hfo_in"]
+        dy = comp["delta_vfo_in"]
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
+
+    else:  # unreal
+        dx = comp["delta_hfo_in"]
+        dy = -comp["delta_vfo_in"]
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
+
+    text = _set_global_settings_for_dcc(text, dcc)
+    return text
+
+
+def _dcc_adjustments(comp):
+    focal_old = comp["focal_mm"]
+    focal_new = focal_old * comp["scale"]
+    return {
+        "nuke": {
+            "focal_old_mm": focal_old,
+            "focal_new_mm": focal_new,
+            "delta_x_in": comp["delta_hfo_in"],
+            "delta_y_in": comp["delta_vfo_in"],
+        },
+        "maya": {
+            "focal_old_mm": focal_old,
+            "focal_new_mm": focal_new,
+            "delta_x_in": comp["delta_hfo_in"],
+            "delta_y_in": comp["delta_vfo_in"],
+        },
+        "unreal": {
+            "focal_old_mm": focal_old,
+            "focal_new_mm": focal_new,
+            "delta_x_in": comp["delta_hfo_in"],
+            "delta_y_in": -comp["delta_vfo_in"],
+        },
+    }
+
+
+def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fbx):
+    dcc = _dcc_adjustments(comp)
     lines = [
-        "Dry run summary",
-        "---------------",
-        "Mode:           {}".format(mode_label),
-        "Transform node: {}".format(transform.name()),
-        "Camera node:    {}".format(camera.name()),
-        "Target camera:  {}".format(repr(target_name)),
-        "FBX path:       {}".format(path_hint),
+        "CameraCrop reframe bake",
+        "----------------------",
+        "Transform: {}".format(transform.name()),
+        "Camera:    {}".format(camera.name()),
+        "Mode:      {}".format(source_mode),
+        "Source FBX: {}".format(source_fbx if source_fbx else "(will export from camera node)"),
         "",
-        "Frame size:     {} x {}".format(int(comp["frame_w"]), int(comp["frame_h"])),
-        "Translate:      ({:.10f}, {:.10f}) px".format(comp["tx"], comp["ty"]),
-        "Center:         ({:.10f}, {:.10f}) px".format(comp["cx"], comp["cy"]),
-        "Scale:          {:.10f}".format(comp["scale"]),
+        "Frame size: {} x {}".format(int(comp["frame_w"]), int(comp["frame_h"])),
+        "Translate: ({:.6f}, {:.6f}) px".format(comp["tx"], comp["ty"]),
+        "Center:    ({:.6f}, {:.6f}) px".format(comp["cx"], comp["cy"]),
+        "Scale:     {:.8f}".format(comp["scale"]),
         "",
-        "Sensor:         {:.10f} mm x {:.10f} mm".format(comp["sensor_w_mm"], comp["sensor_h_mm"]),
-        "Old focal:      {:.10f} mm".format(comp["focal_mm"]),
-        "New focal:      {:.10f} mm".format(comp["new_focal_mm"]),
+        "Per-DCC adjustments:",
+        "  Nuke   -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
+            dcc["nuke"]["focal_old_mm"], dcc["nuke"]["focal_new_mm"], dcc["nuke"]["delta_x_in"], dcc["nuke"]["delta_y_in"]
+        ),
+        "  Maya   -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
+            dcc["maya"]["focal_old_mm"], dcc["maya"]["focal_new_mm"], dcc["maya"]["delta_x_in"], dcc["maya"]["delta_y_in"]
+        ),
+        "  Unreal -> Focal: {:.6f} -> {:.6f} mm, FilmOffset delta: ({:.10f}, {:.10f}) in".format(
+            dcc["unreal"]["focal_old_mm"], dcc["unreal"]["focal_new_mm"], dcc["unreal"]["delta_x_in"], dcc["unreal"]["delta_y_in"]
+        ),
         "",
-        "Delta HFO:      {:.12f} in".format(comp["delta_hfo_in"]),
-        "Delta VFO:      {:.12f} in".format(comp["delta_vfo_in"]),
+        "Output folder:",
+        out_dir,
+        "",
+        "Files:",
+        "  - {}".format(outs["nuke"]),
+        "  - {}".format(outs["maya"]),
+        "  - {}".format(outs["unreal"]),
     ]
-    if extra:
-        lines.extend(["", extra])
     return "\n".join(lines)
 
 
-def bake_selected_transform_into_camera_or_fbx():
+def bake_selected_transform_into_cameras():
     transform, camera = _selected_transform_and_camera()
     _validate_transform(transform)
-    _validate_camera_common(camera)
+    _validate_camera(camera)
 
-    comp = _compute_reframe_values(transform, camera)
-
+    source_fbx = ""
+    source_mode = "manual camera export"
     if _camera_is_reading_from_file(camera):
-        src_fbx = _validate_existing_fbx_camera(camera)
+        source_fbx = _evaluate_file_knob(camera, "file")
+        if not source_fbx:
+            raise ReframeBakeError("Camera is set to read from file, but file path is empty.")
+        if not os.path.exists(source_fbx):
+            raise ReframeBakeError("FBX file does not exist:\n{}".format(source_fbx))
+        if not source_fbx.lower().endswith(".fbx"):
+            raise ReframeBakeError("Camera file must be .fbx")
+        if not _is_ascii_fbx(source_fbx):
+            raise ReframeBakeError("Only ASCII FBX is supported for read-from-file cameras.")
+        source_mode = "patch existing ASCII FBX"
 
-        target_model_name = ""
-        if "fbx_node_name" in camera.knobs():
-            try:
-                target_model_name = str(camera["fbx_node_name"].value()).strip()
-            except Exception:
-                target_model_name = ""
-        if not target_model_name:
-            target_model_name = camera.name()
+    comp = _compute_reframe(transform, camera)
 
-        report = _report_text(
-            "Patch existing ASCII FBX",
-            transform, camera, comp, src_fbx, target_model_name
-        )
-        print(report)
+    default_dir = _default_output_dir(camera)
+    suggested_base = os.path.splitext(os.path.basename(source_fbx))[0] if source_fbx else camera.name()
+    out_dir, base_name = _ask_output_plan(default_dir, suggested_base)
+    if not out_dir:
+        return
 
-        if not nuke.ask(report + "\n\nWrite a new patched FBX?"):
-            return
+    output_names = _new_output_names(base_name)
+    output_paths = {k: _to_nuke_path(os.path.join(out_dir, v)) for k, v in output_names.items()}
 
-        patch_info = _patch_fbx_camera_for_model(
-            src_fbx=src_fbx,
-            target_model_name=target_model_name,
-            delta_hfo_in=comp["delta_hfo_in"],
-            delta_vfo_in=comp["delta_vfo_in"],
-            new_focal_mm=comp["new_focal_mm"],
-            out_fbx=None,
-        )
+    summary = _summary_text(transform, camera, comp, out_dir, output_names, source_mode, source_fbx)
+    print(summary)
+    if not _ask(summary + "\n\nProceed?"):
+        return
 
-        msg = (
-            "Wrote new FBX:\n{}\n\n"
-            "Patched camera model: {}\n"
-            "Connected camera attribute: {}\n\n"
-            "Do you want to repoint the selected Camera to this new file and reload it now?"
-        ).format(
-            patch_info["out_fbx"],
-            patch_info["target_model_name"],
-            patch_info["target_attr_name"],
-        )
+    if not _confirm_overwrite(list(output_paths.values())):
+        return
 
-        if nuke.ask(msg):
-            _reload_camera_from_file(
-                camera,
-                patch_info["out_fbx"],
-                target_name=patch_info["target_model_name"]
-            )
-            _msg(
-                "Done.\n\n"
-                "Camera repointed and reload triggered:\n{}\n\n"
-                "fbx_node_name set to: {}".format(
-                    patch_info["out_fbx"],
-                    patch_info["target_model_name"]
-                )
-            )
-        else:
-            _msg("Done.\n\nNew FBX written:\n{}".format(patch_info["out_fbx"]))
+    target_model_name = _resolve_target_model_name(camera)
 
+    if source_fbx:
+        source_text = _read_text(source_fbx)
+        source_is_static = not any([
+            _camera_property_has_animation(source_text, target_model_name, "FocalLength"),
+            _camera_property_has_animation(source_text, target_model_name, "FilmOffsetX"),
+            _camera_property_has_animation(source_text, target_model_name, "FilmOffsetY"),
+        ])
     else:
-        out_fbx = _ask_save_fbx_path(camera)
-        if not out_fbx:
-            return
+        temp_src = _to_nuke_path(os.path.join(out_dir, output_names["nuke"] + ".tmp_export_source.fbx"))
+        static_only = _camera_is_static_in_nuke(camera)
+        source_is_static = static_only
+        _export_camera_to_ascii_fbx(camera, temp_src, static_only=static_only)
+        if not os.path.exists(temp_src):
+            raise ReframeBakeError("Failed to export source FBX from camera.")
+        if not _is_ascii_fbx(temp_src):
+            raise ReframeBakeError("Exported camera FBX is binary; expected ASCII.")
+        source_text = _read_text(temp_src)
+        try:
+            os.remove(temp_src)
+        except Exception:
+            pass
 
-        if os.path.exists(out_fbx):
-            if not nuke.ask("File already exists:\n{}\n\nOverwrite it?".format(out_fbx)):
-                return
+    for dcc in ("nuke", "maya", "unreal"):
+        patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=source_is_static)
+        _write_text(output_paths[dcc], patched)
 
-        is_static = _camera_is_static_in_nuke(camera)
-        extra = "Export mode: {} frame{}".format(
-            "single" if is_static else "full range",
-            "" if is_static else "s"
-        )
+    imported = _create_imported_camera(output_paths["nuke"], target_model_name, camera)
 
-        report = _report_text(
-            "Create brand-new ASCII FBX",
-            transform, camera, comp, out_fbx, camera.name(), extra=extra
-        )
-        print(report)
-
-        if not nuke.ask(report + "\n\nExport a new ASCII FBX, patch it, and import it back into Nuke?"):
-            return
-
-        _export_camera_to_new_ascii_fbx(camera, out_fbx, single_frame=is_static)
-
-        if not os.path.exists(out_fbx):
-            raise ReframeBakeError(
-                "WriteGeo did not produce the expected FBX file:\n{}".format(out_fbx)
-            )
-
-        if not _is_ascii_fbx(out_fbx):
-            raise ReframeBakeError(
-                "The exported FBX is not ASCII:\n{}".format(out_fbx)
-            )
-
-        patch_info = _patch_fbx_camera_for_model(
-            src_fbx=out_fbx,
-            target_model_name=camera.name(),
-            delta_hfo_in=comp["delta_hfo_in"],
-            delta_vfo_in=comp["delta_vfo_in"],
-            new_focal_mm=comp["new_focal_mm"],
-            out_fbx=out_fbx,
-        )
-
-        new_cam = _create_imported_camera(
-            file_path=out_fbx,
-            target_name=patch_info["target_model_name"],
-            ref_node=camera
-        )
-
-        _msg(
-            "Done.\n\n"
-            "Created and imported new ASCII FBX camera:\n{}\n\n"
-            "Imported camera node: {}\n"
-            "fbx_node_name set to: {}\n"
-            "Patched camera attribute: {}\n\n"
-            .format(
-                out_fbx,
-                new_cam.name(),
-                patch_info["target_model_name"],
-                patch_info["target_attr_name"],
-            )
-        )
+    _msg(
+        "Success.\n\n"
+        "Created FBX files:\n"
+        "- {}\n- {}\n- {}\n\n"
+        "Imported verification camera: {}"
+        .format(output_paths["nuke"], output_paths["maya"], output_paths["unreal"], imported.name())
+    )
 
 
 try:
-    bake_selected_transform_into_camera_or_fbx()
-except ReframeBakeError as e:
-    _msg("Reframe bake failed:\n\n{}".format(e))
+    bake_selected_transform_into_cameras()
+except ReframeBakeError as exc:
+    _msg("Reframe bake failed:\n\n{}".format(exc))
     raise
-except Exception as e:
-    _msg("Unexpected error:\n\n{}".format(e))
+except Exception as exc:
+    _msg("Unexpected error:\n\n{}".format(exc))
     raise
