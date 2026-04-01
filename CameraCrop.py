@@ -748,7 +748,6 @@ def bake_selected_transform_into_cameras():
     else:
         temp_src = _to_nuke_path(os.path.join(out_dir, output_names["nuke"] + ".tmp_export_source.fbx"))
         static_only = _camera_is_static_in_nuke(camera)
-        source_is_static = static_only
         _export_camera_to_ascii_fbx(camera, temp_src, static_only=static_only)
         if not os.path.exists(temp_src):
             raise ReframeBakeError("Failed to export source FBX from camera.")
@@ -760,8 +759,10 @@ def bake_selected_transform_into_cameras():
         except Exception:
             pass
 
+    force_static_rewrite = source_is_static if source_fbx else _camera_is_static_in_nuke(camera)
+
     for dcc in ("nuke", "maya", "unreal"):
-        patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=source_is_static)
+        patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=force_static_rewrite)
         _write_text(output_paths[dcc], patched)
 
     imported = _create_imported_camera(output_paths["nuke"], target_model_name, camera)
