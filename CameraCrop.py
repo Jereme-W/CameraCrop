@@ -150,6 +150,22 @@ def _ask_output_folder(default_dir):
     return chosen
 
 
+def _ask_output_plan(default_dir, default_base):
+    out_dir = _ask_output_folder(default_dir)
+    if not out_dir:
+        return "", ""
+
+    base = nuke.getInput("Base output name (example: Camera_30)", default_base)
+    if base is None:
+        return "", ""
+
+    base = re.sub(r"[^0-9A-Za-z._-]+", "_", base).strip("_")
+    if not base:
+        raise ReframeBakeError("Base output name cannot be empty.")
+
+    return out_dir, base
+
+
 def _read_text(path):
     with open(path, "r", encoding="utf-8", errors="ignore", newline="") as fh:
         return fh.read()
@@ -399,8 +415,8 @@ def _remove_camera_property_animation_links(full_text, target_model_name, proper
     return full_text
 
 
-def _force_static_camera_properties(full_text, target_model_name):
-    for prop in ("FocalLength", "FilmOffsetX", "FilmOffsetY"):
+def _force_static_camera_properties(full_text, target_model_name, properties):
+    for prop in properties:
         full_text = _remove_camera_property_animation_links(full_text, target_model_name, prop)
     return full_text
 
@@ -459,6 +475,10 @@ def _compute_reframe(transform, camera):
         "sensor_w_mm": sensor_w_mm,
         "sensor_h_mm": sensor_h_mm,
         "focal_mm": focal_mm,
+        "shift_x_px": shift_x_px,
+        "shift_y_px": shift_y_px,
+        "delta_u": (shift_x_px / frame_w),
+        "delta_v": (shift_y_px / frame_h),
         "delta_hfo_in": (shift_x_px / frame_w) * (sensor_w_mm * MM_TO_INCH),
         "delta_vfo_in": (shift_y_px / frame_h) * (sensor_h_mm * MM_TO_INCH),
     }
@@ -510,9 +530,9 @@ def _camera_is_static_in_nuke(camera):
 def _new_output_names(base_name):
     clean = re.sub(r"[^0-9A-Za-z._-]+", "_", base_name).strip("_") or "camera"
     return {
-        "nuke": clean + "_reframed_nuke.fbx",
-        "maya": clean + "_reframed_maya.fbx",
-        "unreal": clean + "_reframed_unreal.fbx",
+        "nuke": clean + "_nuke.fbx",
+        "maya": clean + "_maya.fbx",
+        "unreal": clean + "_unreal.fbx",
     }
 
 
@@ -567,23 +587,50 @@ def _create_imported_camera(file_path, target_name, ref_node):
     return cam
 
 
+
+
+def _patch_property_static(full_text, target_model_name, property_name, op):
+    objs, _, attr = _resolve_camera_blocks(full_text, target_model_name)
+    old_val = _get_prop(attr["text"], property_name, 0.0)
+    new_val = op(old_val)
+
+    attr_new = _set_existing_prop(attr["text"], property_name, new_val)
+    if attr_new != attr["text"]:
+        full_text = full_text[:attr["start"]] + attr_new + full_text[attr["end"]:]
+
+    full_text = _remove_camera_property_animation_links(full_text, target_model_name, property_name)
+    return full_text
+
+
 def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=False):
-    delta_x = comp["delta_hfo_in"]
-    delta_y = comp["delta_vfo_in"]
-
-    # DCC-specific behavior. Maya formula is the baseline provided in brief.
-    if dcc == "unreal":
-        # Unreal commonly expects opposite vertical film offset orientation.
-        delta_y = -delta_y
-
     scale = comp["scale"]
     text = source_text
 
-    text = _patch_property_everywhere(text, target_model_name, "FocalLength", lambda old: old * scale)
-    text = _patch_property_everywhere(text, target_model_name, "FilmOffsetX", lambda old: old + delta_x)
-    text = _patch_property_everywhere(text, target_model_name, "FilmOffsetY", lambda old: old + delta_y)
     if force_static:
-        text = _force_static_camera_properties(text, target_model_name)
+        apply_prop = lambda t, p, fn: _patch_property_static(t, target_model_name, p, fn)
+    else:
+        apply_prop = lambda t, p, fn: _patch_property_everywhere(t, target_model_name, p, fn)
+
+    text = apply_prop(text, "FocalLength", lambda old: old * scale)
+
+    if dcc == "nuke":
+        # Nuke import maps FBX FilmOffsetX/Y to win_translate u/v.
+        dx = comp["delta_hfo_in"]
+        dy = comp["delta_vfo_in"]
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
+
+    elif dcc == "maya":
+        dx = comp["delta_hfo_in"]
+        dy = comp["delta_vfo_in"]
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
+
+    else:  # unreal
+        dx = comp["delta_hfo_in"]
+        dy = -comp["delta_vfo_in"]
+        text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
+        text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
     text = _set_global_settings_for_dcc(text, dcc)
     return text
@@ -593,9 +640,24 @@ def _dcc_adjustments(comp):
     focal_old = comp["focal_mm"]
     focal_new = focal_old * comp["scale"]
     return {
-        "nuke": {"focal_old_mm": focal_old, "focal_new_mm": focal_new, "delta_x_in": comp["delta_hfo_in"], "delta_y_in": comp["delta_vfo_in"]},
-        "maya": {"focal_old_mm": focal_old, "focal_new_mm": focal_new, "delta_x_in": comp["delta_hfo_in"], "delta_y_in": comp["delta_vfo_in"]},
-        "unreal": {"focal_old_mm": focal_old, "focal_new_mm": focal_new, "delta_x_in": comp["delta_hfo_in"], "delta_y_in": -comp["delta_vfo_in"]},
+        "nuke": {
+            "focal_old_mm": focal_old,
+            "focal_new_mm": focal_new,
+            "delta_x_in": comp["delta_hfo_in"],
+            "delta_y_in": comp["delta_vfo_in"],
+        },
+        "maya": {
+            "focal_old_mm": focal_old,
+            "focal_new_mm": focal_new,
+            "delta_x_in": comp["delta_hfo_in"],
+            "delta_y_in": comp["delta_vfo_in"],
+        },
+        "unreal": {
+            "focal_old_mm": focal_old,
+            "focal_new_mm": focal_new,
+            "delta_x_in": comp["delta_hfo_in"],
+            "delta_y_in": -comp["delta_vfo_in"],
+        },
     }
 
 
@@ -658,12 +720,12 @@ def bake_selected_transform_into_cameras():
     comp = _compute_reframe(transform, camera)
 
     default_dir = _default_output_dir(camera)
-    out_dir = _ask_output_folder(default_dir)
+    suggested_base = os.path.splitext(os.path.basename(source_fbx))[0] if source_fbx else camera.name()
+    out_dir, base_name = _ask_output_plan(default_dir, suggested_base)
     if not out_dir:
         return
 
-    original_name = os.path.splitext(os.path.basename(source_fbx))[0] if source_fbx else camera.name()
-    output_names = _new_output_names(original_name)
+    output_names = _new_output_names(base_name)
     output_paths = {k: _to_nuke_path(os.path.join(out_dir, v)) for k, v in output_names.items()}
 
     summary = _summary_text(transform, camera, comp, out_dir, output_names, source_mode, source_fbx)
