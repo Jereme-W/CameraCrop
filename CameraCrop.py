@@ -387,8 +387,8 @@ def _patch_property_everywhere(full_text, target_model_name, property_name, op):
     return full_text
 
 
-def _camera_property_curve_links(full_text, target_model_name, property_name):
-    objs, _, attr = _resolve_camera_blocks(full_text, target_model_name)
+def _property_curve_links_for_object(full_text, object_id, property_name):
+    objs = _fbx_objects(full_text)
     _, op_conns = _fbx_connections(full_text)
     curve_nodes = {x["id"]: x for x in objs["curve_nodes"]}
     curves = {x["id"]: x for x in objs["curves"]}
@@ -397,7 +397,7 @@ def _camera_property_curve_links(full_text, target_model_name, property_name):
     curve_id = None
 
     for src_id, dst_id, prop_name in op_conns:
-        if dst_id == attr["id"] and prop_name == property_name and src_id in curve_nodes:
+        if dst_id == object_id and prop_name == property_name and src_id in curve_nodes:
             curve_node_id = src_id
             break
 
@@ -408,6 +408,12 @@ def _camera_property_curve_links(full_text, target_model_name, property_name):
                 curve_id = src_id
                 break
 
+    return curve_node_id, curve_id
+
+
+def _camera_property_curve_links(full_text, target_model_name, property_name):
+    _, _, attr = _resolve_camera_blocks(full_text, target_model_name)
+    curve_node_id, curve_id = _property_curve_links_for_object(full_text, attr["id"], property_name)
     return attr["id"], curve_node_id, curve_id
 
 
@@ -416,16 +422,16 @@ def _camera_property_has_animation(full_text, target_model_name, property_name):
     return curve_node_id is not None or curve_id is not None
 
 
-def _remove_camera_property_animation_links(full_text, target_model_name, property_name):
-    attr_id, curve_node_id, curve_id = _camera_property_curve_links(full_text, target_model_name, property_name)
+def _remove_property_animation_links_for_object(full_text, object_id, property_name):
+    curve_node_id, curve_id = _property_curve_links_for_object(full_text, object_id, property_name)
     if curve_node_id is None:
         return full_text
 
-    pat_attr = re.compile(
-        r'^\s*C:\s*"OP"\s*,\s*{}\s*,\s*{}\s*,\s*"{}"\s*\r?\n?'.format(curve_node_id, attr_id, re.escape(property_name)),
+    pat_obj = re.compile(
+        r'^\s*C:\s*"OP"\s*,\s*{}\s*,\s*{}\s*,\s*"{}"\s*\r?\n?'.format(curve_node_id, object_id, re.escape(property_name)),
         re.MULTILINE,
     )
-    full_text = pat_attr.sub("", full_text)
+    full_text = pat_obj.sub("", full_text)
 
     if curve_id is not None:
         pat_curve = re.compile(
@@ -437,35 +443,27 @@ def _remove_camera_property_animation_links(full_text, target_model_name, proper
     return full_text
 
 
+def _remove_camera_property_animation_links(full_text, target_model_name, property_name):
+    attr_id, _, _ = _camera_property_curve_links(full_text, target_model_name, property_name)
+    return _remove_property_animation_links_for_object(full_text, attr_id, property_name)
+
+
 def _force_static_camera_properties(full_text, target_model_name, properties):
     for prop in properties:
         full_text = _remove_camera_property_animation_links(full_text, target_model_name, prop)
     return full_text
 
 
-def _set_global_settings_for_dcc(text, dcc):
-    if dcc == "maya":
-        axis = {"UpAxis": 1, "UpAxisSign": 1, "FrontAxis": 2, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
-    elif dcc == "unreal":
-        # Unreal camera FBX import expects a Z-up basis in global settings.
-        # We keep FBX units in centimeters (UnitScaleFactor=100) to match Unreal's
-        # importer expectations for scene scale while camera FilmOffset values remain
-        # authored in FBX camera units (inches; see _unreal_film_offset_from_reframe).
-        axis = {"UpAxis": 2, "UpAxisSign": 1, "FrontAxis": 1, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
-    else:  # nuke
-        axis = {"UpAxis": 1, "UpAxisSign": 1, "FrontAxis": 2, "FrontAxisSign": 1, "CoordAxis": 0, "CoordAxisSign": 1}
+def _remove_static_camera_animation(full_text, target_model_name):
+    _, model, attr = _resolve_camera_blocks(full_text, target_model_name)
 
-    for k, v in axis.items():
-        text = re.sub(
-            r'(P:\s*"{}"\s*,\s*"int"\s*,\s*"Integer"\s*,\s*""\s*,\s*)([-+0-9.eE]+)'.format(re.escape(k)),
-            lambda m, _v=v: "{}{}".format(m.group(1), _v),
-            text,
-        )
+    for prop in ("Lcl Translation", "Lcl Rotation", "Lcl Scaling"):
+        full_text = _remove_property_animation_links_for_object(full_text, model["id"], prop)
 
-    # Normalize unit to centimeters where possible.
-    text = re.sub(r'(P:\s*"UnitScaleFactor"\s*,\s*"double"\s*,\s*"Number"\s*,\s*""\s*,\s*)([-+0-9.eE]+)', r"\g<1>100", text)
-    text = re.sub(r'(P:\s*"OriginalUnitScaleFactor"\s*,\s*"double"\s*,\s*"Number"\s*,\s*""\s*,\s*)([-+0-9.eE]+)', r"\g<1>100", text)
-    return text
+    for prop in ("FocalLength", "FilmOffsetX", "FilmOffsetY", "NearPlane", "FarPlane", "Roll", "FieldOfView", "FieldOfViewX", "FieldOfViewY"):
+        full_text = _remove_property_animation_links_for_object(full_text, attr["id"], prop)
+
+    return full_text
 
 
 def _compute_reframe(transform, camera):
@@ -657,8 +655,8 @@ def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_
     if dcc == "nuke":
         # Nuke consumes win_translate in normalized filmback units (u/v), while FBX stores FilmOffset in inches.
         # Convert desired win_translate deltas to FBX FilmOffset deltas using the camera filmback size.
-        dx = _nuke_win_translate_to_film_offset_in(comp["delta_u"], comp["sensor_w_mm"])
-        dy = _nuke_win_translate_to_film_offset_in(comp["delta_v"], comp["sensor_h_mm"])
+        dx = _nuke_win_translate_x_to_film_offset_in(-comp["delta_u"], comp["sensor_w_mm"])
+        dy = _nuke_win_translate_y_to_film_offset_in(-comp["delta_v"], comp["sensor_w_mm"])
         # FBX FilmOffsetX/Y are inch values; after import, Nuke converts them back to normalized win_translate.
         text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
         text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
@@ -677,7 +675,8 @@ def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_
         text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
         text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
-    text = _set_global_settings_for_dcc(text, dcc)
+    if force_static:
+        text = _remove_static_camera_animation(text, target_model_name)
     return text
 
 
@@ -708,12 +707,18 @@ def _dcc_adjustments(comp):
     }
 
 
-def _nuke_win_translate_to_film_offset_in(delta_win_translate, aperture_mm):
-    # Nuke win_translate is normalized to the aperture dimension.
-    # FBX FilmOffset is in inches, so:
-    #   film_offset_in = win_translate * aperture_in
-    aperture_in = aperture_mm * MM_TO_INCH
-    return delta_win_translate * aperture_in
+def _nuke_win_translate_x_to_film_offset_in(delta_win_translate_x, haperture_mm):
+    # Nuke's win_translate.x normalization uses half the horizontal aperture:
+    #   win_translate.x = delta_x_mm / (haperture_mm / 2)
+    # => delta_x_mm = win_translate.x * (haperture_mm / 2)
+    return delta_win_translate_x * (haperture_mm * 0.5 * MM_TO_INCH)
+
+
+def _nuke_win_translate_y_to_film_offset_in(delta_win_translate_y, haperture_mm):
+    # Nuke's win_translate.y normalization also uses horizontal aperture:
+    #   win_translate.y = delta_y_mm / haperture_mm
+    # => delta_y_mm = win_translate.y * haperture_mm
+    return delta_win_translate_y * (haperture_mm * MM_TO_INCH)
 
 
 def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fbx):
