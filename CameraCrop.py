@@ -678,7 +678,7 @@ def _create_imported_camera(file_path, target_name, ref_node):
     except Exception:
         pass
     try:
-        cam.setXpos(ref_node.xpos() + 100)
+        cam.setXpos(ref_node.xpos())
         cam.setYpos(ref_node.ypos() + 100)
     except Exception:
         pass
