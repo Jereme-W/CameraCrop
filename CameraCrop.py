@@ -660,7 +660,8 @@ def _import_fbx_camera_with_duplicate_refresh(
     except Exception:
         pass
     try:
-        cam.setXYpos(xpos, ypos)
+        cam.setXpos(ref_node.xpos())
+        cam.setYpos(ref_node.ypos() + 100)
     except Exception:
         pass
 
