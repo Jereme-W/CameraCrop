@@ -600,81 +600,63 @@ def _get_enum_names(knob):
         return []
 
 
-def _select_camera_node(nuke_cam_node, wanted_camera_name, max_tries=20, delay_ms=100):
-    node_name = nuke_cam_node.fullName()
-    state = {"tries": 0}
+def _safe_reload(node):
+    try:
+        if "reload" in node.knobs():
+            node["reload"].execute()
+            return True
+    except Exception:
+        pass
+    return False
 
-    def try_finish():
-        state["tries"] += 1
 
-        cam_now = nuke.toNode(node_name)
-        if cam_now is None:
-            nuke.tprint("FBX setup aborted: node no longer exists: {}".format(node_name))
-            return
+def _duplicate_node(node):
+    old_selection = nuke.selectedNodes()
+    try:
+        for n in old_selection:
+            n.setSelected(False)
 
+        node.setSelected(True)
+        nuke.nodeCopy("%clipboard%")
+        new_node = nuke.nodePaste("%clipboard%")
+
+        for n in nuke.selectedNodes():
+            n.setSelected(False)
+        new_node.setSelected(True)
+        return new_node
+    finally:
         try:
-            cam_now.forceValidate()
+            for n in nuke.selectedNodes():
+                n.setSelected(False)
         except Exception:
             pass
-
-        try:
-            if "reload" in cam_now.knobs():
-                try:
-                    cam_now["reload"].execute()
-                except Exception:
-                    pass
-
-            names = _get_enum_names(cam_now["fbx_node_name"])
-        except Exception as exc:
-            if state["tries"] < max_tries:
-                QtCore.QTimer.singleShot(delay_ms, try_finish)
-            else:
-                nuke.warning("Could not inspect FBX camera list.\n{}".format(exc))
-            return
-
-        if wanted_camera_name in names:
+        for n in old_selection:
             try:
-                cam_now["fbx_node_name"].setValue(wanted_camera_name)
-            except Exception:
-                try:
-                    cam_now["fbx_node_name"].setValue(names.index(wanted_camera_name))
-                except Exception as exc:
-                    nuke.warning(
-                        "Found camera '{}', but could not set fbx_node_name.\n{}".format(
-                            wanted_camera_name, exc
-                        )
-                    )
-                    return
-
-            try:
-                if "reload" in cam_now.knobs():
-                    cam_now["reload"].execute()
+                n.setSelected(True)
             except Exception:
                 pass
 
-            nuke.tprint("Selected FBX camera: {}".format(wanted_camera_name))
-            return
 
-        if state["tries"] < max_tries:
-            QtCore.QTimer.singleShot(delay_ms, try_finish)
-        else:
-            non_producer = [n for n in names if n not in PRODUCER_NAMES]
-            nuke.warning(
-                "Could not find FBX camera '{}'.\n\nAvailable names:\n{}\n\nNon-producer names:\n{}".format(
-                    wanted_camera_name,
-                    "\n".join(names) if names else "(none)",
-                    "\n".join(non_producer) if non_producer else "(none)",
-                )
-            )
-
-    QtCore.QTimer.singleShot(delay_ms, try_finish)
-    return nuke_cam_node
+def _position_duplicate_near_original(src_node, dup_node, x_offset=120, y_offset=0):
+    try:
+        dup_node.setXYpos(src_node.xpos() + x_offset, src_node.ypos() + y_offset)
+    except Exception:
+        pass
 
 
-def _create_imported_camera(file_path, target_name, ref_node):
+def _import_fbx_camera_with_duplicate_refresh(
+    fbx_path,
+    wanted_camera_name,
+    node_base_name,
+    xpos,
+    ypos,
+    delete_original=True,
+    max_tries=30,
+    delay_ms=100,
+):
     cam = nuke.nodes.Camera2()
     try:
-        cam.setName(ref_node.name() + "_reframed")
+        cam.setName(node_base_name + "_reframed")
     except Exception:
         pass
     try:
@@ -685,15 +667,117 @@ def _create_imported_camera(file_path, target_name, ref_node):
 
     if "read_from_file" in cam.knobs():
         cam["read_from_file"].setValue(True)
-    cam["file"].setValue(_to_nuke_path(file_path))
-    if "reload" in cam.knobs():
+    cam["file"].setValue(_to_nuke_path(fbx_path))
+    _safe_reload(cam)
+
+    original_name = cam.fullName()
+    state = {"tries": 0, "finished": False}
+
+    def finish_with_duplicate():
+        original = nuke.toNode(original_name)
+        if original is None:
+            return
+
+        _safe_reload(original)
         try:
-            cam["reload"].execute()
+            dup = _duplicate_node(original)
+        except Exception as exc:
+            nuke.warning("Copy/paste refresh failed:\n{}".format(exc))
+            return
+
+        _position_duplicate_near_original(original, dup)
+        try:
+            wanted_name = original.name() + "_FBX"
+            if dup.name() != wanted_name:
+                dup.setName(wanted_name, uncollide=True)
         except Exception:
             pass
 
-    _select_camera_node(cam, target_name)
+        _safe_reload(dup)
+        try:
+            names = _get_enum_names(dup["fbx_node_name"])
+            if wanted_camera_name in names:
+                try:
+                    dup["fbx_node_name"].setValue(wanted_camera_name)
+                except Exception:
+                    dup["fbx_node_name"].setValue(names.index(wanted_camera_name))
+                _safe_reload(dup)
+        except Exception:
+            pass
+
+        if delete_original:
+            try:
+                nuke.delete(original)
+            except Exception:
+                pass
+        try:
+            dup.setSelected(True)
+        except Exception:
+            pass
+
+    def try_set_camera_name():
+        if state["finished"]:
+            return
+        state["tries"] += 1
+
+        cam_now = nuke.toNode(original_name)
+        if cam_now is None:
+            return
+
+        try:
+            cam_now.forceValidate()
+        except Exception:
+            pass
+
+        try:
+            names = _get_enum_names(cam_now["fbx_node_name"])
+        except Exception:
+            names = []
+
+        if wanted_camera_name in names:
+            try:
+                cam_now["fbx_node_name"].setValue(wanted_camera_name)
+            except Exception:
+                try:
+                    cam_now["fbx_node_name"].setValue(names.index(wanted_camera_name))
+                except Exception as exc:
+                    nuke.warning(
+                        "Found camera '{}', but could not set fbx_node_name:\n{}".format(
+                            wanted_camera_name, exc
+                        )
+                    )
+                    return
+            state["finished"] = True
+            QtCore.QTimer.singleShot(0, finish_with_duplicate)
+            return
+
+        if state["tries"] < max_tries:
+            QtCore.QTimer.singleShot(delay_ms, try_set_camera_name)
+        else:
+            non_producer = [n for n in names if n not in PRODUCER_NAMES]
+            nuke.warning(
+                "Could not find FBX camera '{}'.\n\nAvailable names:\n{}\n\nNon-producer names:\n{}".format(
+                    wanted_camera_name,
+                    "\n".join(names) if names else "(none)",
+                    "\n".join(non_producer) if non_producer else "(none)",
+                )
+            )
+
+    QtCore.QTimer.singleShot(delay_ms, try_set_camera_name)
     return cam
+
+
+def _create_imported_camera(file_path, target_name, ref_node):
+    return _import_fbx_camera_with_duplicate_refresh(
+        fbx_path=file_path,
+        wanted_camera_name=target_name,
+        node_base_name=ref_node.name(),
+        xpos=ref_node.xpos() + 100,
+        ypos=ref_node.ypos() + 100,
+        delete_original=True,
+        max_tries=30,
+        delay_ms=100,
+    )
 
 
 
