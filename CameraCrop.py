@@ -637,7 +637,7 @@ def _duplicate_node(node):
                 pass
 
 
-def _position_duplicate_near_original(src_node, dup_node, x_offset=120, y_offset=0):
+def _position_duplicate_near_original(src_node, dup_node, x_offset=0, y_offset=30):
     try:
         dup_node.setXYpos(src_node.xpos() + x_offset, src_node.ypos() + y_offset)
     except Exception:
