@@ -2,6 +2,7 @@ import os
 import re
 
 import nuke
+from PySide2 import QtCore
 
 MM_TO_INCH = 0.0393701
 EPS = 1e-8
@@ -581,6 +582,95 @@ def _confirm_overwrite(paths):
     return _ask("The following files already exist and will be overwritten:\n\n{}\n\nContinue?".format("\n".join(existing)))
 
 
+PRODUCER_NAMES = {
+    "Producer Perspective",
+    "Producer Top",
+    "Producer Bottom",
+    "Producer Left",
+    "Producer Right",
+    "Producer Front",
+    "Producer Back",
+}
+
+
+def _get_enum_names(knob):
+    try:
+        return list(knob.values())
+    except Exception:
+        return []
+
+
+def _select_camera_node(nuke_cam_node, wanted_camera_name, max_tries=20, delay_ms=100):
+    node_name = nuke_cam_node.fullName()
+    state = {"tries": 0}
+
+    def try_finish():
+        state["tries"] += 1
+
+        cam_now = nuke.toNode(node_name)
+        if cam_now is None:
+            nuke.tprint("FBX setup aborted: node no longer exists: {}".format(node_name))
+            return
+
+        try:
+            cam_now.forceValidate()
+        except Exception:
+            pass
+
+        try:
+            if "reload" in cam_now.knobs():
+                try:
+                    cam_now["reload"].execute()
+                except Exception:
+                    pass
+
+            names = _get_enum_names(cam_now["fbx_node_name"])
+        except Exception as exc:
+            if state["tries"] < max_tries:
+                QtCore.QTimer.singleShot(delay_ms, try_finish)
+            else:
+                nuke.warning("Could not inspect FBX camera list.\n{}".format(exc))
+            return
+
+        if wanted_camera_name in names:
+            try:
+                cam_now["fbx_node_name"].setValue(wanted_camera_name)
+            except Exception:
+                try:
+                    cam_now["fbx_node_name"].setValue(names.index(wanted_camera_name))
+                except Exception as exc:
+                    nuke.warning(
+                        "Found camera '{}', but could not set fbx_node_name.\n{}".format(
+                            wanted_camera_name, exc
+                        )
+                    )
+                    return
+
+            try:
+                if "reload" in cam_now.knobs():
+                    cam_now["reload"].execute()
+            except Exception:
+                pass
+
+            nuke.tprint("Selected FBX camera: {}".format(wanted_camera_name))
+            return
+
+        if state["tries"] < max_tries:
+            QtCore.QTimer.singleShot(delay_ms, try_finish)
+        else:
+            non_producer = [n for n in names if n not in PRODUCER_NAMES]
+            nuke.warning(
+                "Could not find FBX camera '{}'.\n\nAvailable names:\n{}\n\nNon-producer names:\n{}".format(
+                    wanted_camera_name,
+                    "\n".join(names) if names else "(none)",
+                    "\n".join(non_producer) if non_producer else "(none)",
+                )
+            )
+
+    QtCore.QTimer.singleShot(delay_ms, try_finish)
+    return nuke_cam_node
+
+
 def _create_imported_camera(file_path, target_name, ref_node):
     cam = nuke.nodes.Camera2()
     try:
@@ -588,8 +678,8 @@ def _create_imported_camera(file_path, target_name, ref_node):
     except Exception:
         pass
     try:
-        cam.setXpos(ref_node.xpos() + 160)
-        cam.setYpos(ref_node.ypos())
+        cam.setXpos(ref_node.xpos() + 100)
+        cam.setYpos(ref_node.ypos() + 100)
     except Exception:
         pass
 
@@ -601,16 +691,8 @@ def _create_imported_camera(file_path, target_name, ref_node):
             cam["reload"].execute()
         except Exception:
             pass
-    if target_name and "fbx_node_name" in cam.knobs():
-        try:
-            vals = list(cam["fbx_node_name"].values())
-            if target_name in vals:
-                cam["fbx_node_name"].setValue(vals.index(target_name))
-        except Exception:
-            try:
-                cam["fbx_node_name"].setValue(target_name)
-            except Exception:
-                pass
+
+    _select_camera_node(cam, target_name)
     return cam
 
 
@@ -639,6 +721,26 @@ def _unreal_film_offset_from_reframe(comp):
         "delta_y": -comp["delta_vfo_in"],
         "units": "in",
     }
+
+
+def _set_default_camera_in_fbx_text(source_text, camera_name):
+    if not camera_name:
+        return source_text
+
+    pat = re.compile(r'(^[ \t]*P:\s*"DefaultCamera"\s*,\s*"KString"\s*,\s*""\s*,\s*""\s*,\s*")[^"]*(".*$)', re.MULTILINE)
+    if pat.search(source_text):
+        safe_name = camera_name.replace("\\", "\\\\").replace('"', '\\"')
+        return pat.sub(lambda m: '{}{}{}'.format(m.group(1), safe_name, m.group(2)), source_text, count=1)
+
+    block = re.search(r'(GlobalSettings:\s*\{\s*\r?\n(?:.*?\r?\n)*?[ \t]*Properties70:\s*\{\s*\r?\n)', source_text, re.DOTALL)
+    if not block:
+        return source_text
+
+    return (
+        source_text[:block.end()] +
+        '        P: "DefaultCamera", "KString", "", "", "{}"\n'.format(camera_name) +
+        source_text[block.end():]
+    )
 
 
 def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=False):
@@ -760,6 +862,7 @@ def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fb
 
 def bake_selected_transform_into_cameras():
     transform, camera = _selected_transform_and_camera()
+    selected_camera_name = camera.name()
     _validate_transform(transform)
     _validate_camera(camera)
 
@@ -823,9 +926,11 @@ def bake_selected_transform_into_cameras():
 
     for dcc in ("nuke", "maya", "unreal"):
         patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=force_static_rewrite)
+        if dcc == "nuke":
+            patched = _set_default_camera_in_fbx_text(patched, selected_camera_name)
         _write_text(output_paths[dcc], patched)
 
-    imported = _create_imported_camera(output_paths["nuke"], target_model_name, camera)
+    imported = _create_imported_camera(output_paths["nuke"], selected_camera_name, camera)
 
     _msg(
         "Success.\n\n"
