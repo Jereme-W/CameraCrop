@@ -2,6 +2,7 @@ import os
 import re
 
 import nuke
+from PySide2 import QtCore
 
 MM_TO_INCH = 0.0393701
 EPS = 1e-8
@@ -581,37 +582,201 @@ def _confirm_overwrite(paths):
     return _ask("The following files already exist and will be overwritten:\n\n{}\n\nContinue?".format("\n".join(existing)))
 
 
-def _create_imported_camera(file_path, target_name, ref_node):
+PRODUCER_NAMES = {
+    "Producer Perspective",
+    "Producer Top",
+    "Producer Bottom",
+    "Producer Left",
+    "Producer Right",
+    "Producer Front",
+    "Producer Back",
+}
+
+
+def _get_enum_names(knob):
+    try:
+        return list(knob.values())
+    except Exception:
+        return []
+
+
+def _safe_reload(node):
+    try:
+        if "reload" in node.knobs():
+            node["reload"].execute()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _duplicate_node(node):
+    old_selection = nuke.selectedNodes()
+    try:
+        for n in old_selection:
+            n.setSelected(False)
+
+        node.setSelected(True)
+        nuke.nodeCopy("%clipboard%")
+        new_node = nuke.nodePaste("%clipboard%")
+
+        for n in nuke.selectedNodes():
+            n.setSelected(False)
+        new_node.setSelected(True)
+        return new_node
+    finally:
+        try:
+            for n in nuke.selectedNodes():
+                n.setSelected(False)
+        except Exception:
+            pass
+        for n in old_selection:
+            try:
+                n.setSelected(True)
+            except Exception:
+                pass
+
+
+def _position_duplicate_near_original(src_node, dup_node, x_offset=120, y_offset=0):
+    try:
+        dup_node.setXYpos(src_node.xpos() + x_offset, src_node.ypos() + y_offset)
+    except Exception:
+        pass
+
+
+def _import_fbx_camera_with_duplicate_refresh(
+    fbx_path,
+    wanted_camera_name,
+    node_base_name,
+    xpos,
+    ypos,
+    delete_original=True,
+    max_tries=30,
+    delay_ms=100,
+):
     cam = nuke.nodes.Camera2()
     try:
-        cam.setName(ref_node.name() + "_reframed")
+        cam.setName(node_base_name + "_reframed")
     except Exception:
         pass
     try:
-        cam.setXpos(ref_node.xpos() + 160)
-        cam.setYpos(ref_node.ypos())
+        cam.setXYpos(xpos, ypos)
     except Exception:
         pass
 
     if "read_from_file" in cam.knobs():
         cam["read_from_file"].setValue(True)
-    cam["file"].setValue(_to_nuke_path(file_path))
-    if "reload" in cam.knobs():
+    cam["file"].setValue(_to_nuke_path(fbx_path))
+    _safe_reload(cam)
+
+    original_name = cam.fullName()
+    state = {"tries": 0, "finished": False}
+
+    def finish_with_duplicate():
+        original = nuke.toNode(original_name)
+        if original is None:
+            return
+
+        _safe_reload(original)
         try:
-            cam["reload"].execute()
+            dup = _duplicate_node(original)
+        except Exception as exc:
+            nuke.warning("Copy/paste refresh failed:\n{}".format(exc))
+            return
+
+        _position_duplicate_near_original(original, dup)
+        try:
+            wanted_name = original.name() + "_FBX"
+            if dup.name() != wanted_name:
+                dup.setName(wanted_name, uncollide=True)
         except Exception:
             pass
-    if target_name and "fbx_node_name" in cam.knobs():
+
+        _safe_reload(dup)
         try:
-            vals = list(cam["fbx_node_name"].values())
-            if target_name in vals:
-                cam["fbx_node_name"].setValue(vals.index(target_name))
+            names = _get_enum_names(dup["fbx_node_name"])
+            if wanted_camera_name in names:
+                try:
+                    dup["fbx_node_name"].setValue(wanted_camera_name)
+                except Exception:
+                    dup["fbx_node_name"].setValue(names.index(wanted_camera_name))
+                _safe_reload(dup)
         except Exception:
+            pass
+
+        if delete_original:
             try:
-                cam["fbx_node_name"].setValue(target_name)
+                nuke.delete(original)
             except Exception:
                 pass
+        try:
+            dup.setSelected(True)
+        except Exception:
+            pass
+
+    def try_set_camera_name():
+        if state["finished"]:
+            return
+        state["tries"] += 1
+
+        cam_now = nuke.toNode(original_name)
+        if cam_now is None:
+            return
+
+        try:
+            cam_now.forceValidate()
+        except Exception:
+            pass
+
+        try:
+            names = _get_enum_names(cam_now["fbx_node_name"])
+        except Exception:
+            names = []
+
+        if wanted_camera_name in names:
+            try:
+                cam_now["fbx_node_name"].setValue(wanted_camera_name)
+            except Exception:
+                try:
+                    cam_now["fbx_node_name"].setValue(names.index(wanted_camera_name))
+                except Exception as exc:
+                    nuke.warning(
+                        "Found camera '{}', but could not set fbx_node_name:\n{}".format(
+                            wanted_camera_name, exc
+                        )
+                    )
+                    return
+            state["finished"] = True
+            QtCore.QTimer.singleShot(0, finish_with_duplicate)
+            return
+
+        if state["tries"] < max_tries:
+            QtCore.QTimer.singleShot(delay_ms, try_set_camera_name)
+        else:
+            non_producer = [n for n in names if n not in PRODUCER_NAMES]
+            nuke.warning(
+                "Could not find FBX camera '{}'.\n\nAvailable names:\n{}\n\nNon-producer names:\n{}".format(
+                    wanted_camera_name,
+                    "\n".join(names) if names else "(none)",
+                    "\n".join(non_producer) if non_producer else "(none)",
+                )
+            )
+
+    QtCore.QTimer.singleShot(delay_ms, try_set_camera_name)
     return cam
+
+
+def _create_imported_camera(file_path, target_name, ref_node):
+    return _import_fbx_camera_with_duplicate_refresh(
+        fbx_path=file_path,
+        wanted_camera_name=target_name,
+        node_base_name=ref_node.name(),
+        xpos=ref_node.xpos() + 100,
+        ypos=ref_node.ypos() + 100,
+        delete_original=True,
+        max_tries=30,
+        delay_ms=100,
+    )
 
 
 
@@ -639,6 +804,26 @@ def _unreal_film_offset_from_reframe(comp):
         "delta_y": -comp["delta_vfo_in"],
         "units": "in",
     }
+
+
+def _set_default_camera_in_fbx_text(source_text, camera_name):
+    if not camera_name:
+        return source_text
+
+    pat = re.compile(r'(^[ \t]*P:\s*"DefaultCamera"\s*,\s*"KString"\s*,\s*""\s*,\s*""\s*,\s*")[^"]*(".*$)', re.MULTILINE)
+    if pat.search(source_text):
+        safe_name = camera_name.replace("\\", "\\\\").replace('"', '\\"')
+        return pat.sub(lambda m: '{}{}{}'.format(m.group(1), safe_name, m.group(2)), source_text, count=1)
+
+    block = re.search(r'(GlobalSettings:\s*\{\s*\r?\n(?:.*?\r?\n)*?[ \t]*Properties70:\s*\{\s*\r?\n)', source_text, re.DOTALL)
+    if not block:
+        return source_text
+
+    return (
+        source_text[:block.end()] +
+        '        P: "DefaultCamera", "KString", "", "", "{}"\n'.format(camera_name) +
+        source_text[block.end():]
+    )
 
 
 def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=False):
@@ -760,6 +945,7 @@ def _summary_text(transform, camera, comp, out_dir, outs, source_mode, source_fb
 
 def bake_selected_transform_into_cameras():
     transform, camera = _selected_transform_and_camera()
+    selected_camera_name = camera.name()
     _validate_transform(transform)
     _validate_camera(camera)
 
@@ -823,9 +1009,11 @@ def bake_selected_transform_into_cameras():
 
     for dcc in ("nuke", "maya", "unreal"):
         patched = _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_static=force_static_rewrite)
+        if dcc == "nuke":
+            patched = _set_default_camera_in_fbx_text(patched, selected_camera_name)
         _write_text(output_paths[dcc], patched)
 
-    imported = _create_imported_camera(output_paths["nuke"], target_model_name, camera)
+    imported = _create_imported_camera(output_paths["nuke"], selected_camera_name, camera)
 
     _msg(
         "Success.\n\n"
