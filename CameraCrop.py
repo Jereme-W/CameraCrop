@@ -514,7 +514,7 @@ def _compute_reframe(transform, camera):
     delta_u = (shift_x_px / frame_w)
     delta_v = (shift_y_px / frame_h)
     nuke_delta_u = delta_u * -2.0
-    nuke_delta_v = delta_v / ((frame_w / frame_h) / 2.0)
+    nuke_delta_v = delta_v / ((frame_w / frame_h) / -2.0)
 
     return {
         "tx": tx,
