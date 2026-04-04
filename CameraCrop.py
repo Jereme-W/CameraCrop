@@ -464,6 +464,28 @@ def _remove_static_camera_animation(full_text, target_model_name):
     for prop in ("FocalLength", "FilmOffsetX", "FilmOffsetY", "NearPlane", "FarPlane", "Roll", "FieldOfView", "FieldOfViewX", "FieldOfViewY"):
         full_text = _remove_property_animation_links_for_object(full_text, attr["id"], prop)
 
+    full_text = _remove_unreferenced_animation_objects(full_text)
+    return full_text
+
+
+def _remove_unreferenced_animation_objects(full_text):
+    objs = _fbx_objects(full_text)
+    oo, op = _fbx_connections(full_text)
+    referenced_ids = set()
+    for a, b in oo:
+        referenced_ids.add(a)
+        referenced_ids.add(b)
+    for a, b, _ in op:
+        referenced_ids.add(a)
+        referenced_ids.add(b)
+
+    removals = []
+    for item in objs["curves"] + objs["curve_nodes"]:
+        if item["id"] not in referenced_ids:
+            removals.append((item["start"], item["end"]))
+
+    for s, e in sorted(removals, key=lambda x: x[0], reverse=True):
+        full_text = full_text[:s] + full_text[e:]
     return full_text
 
 
@@ -491,6 +513,8 @@ def _compute_reframe(transform, camera):
 
     delta_u = (shift_x_px / frame_w)
     delta_v = (shift_y_px / frame_h)
+    nuke_delta_u = delta_u * -2.0
+    nuke_delta_v = delta_v / ((frame_w / frame_h) / 2.0)
 
     return {
         "tx": tx,
@@ -507,6 +531,8 @@ def _compute_reframe(transform, camera):
         "shift_y_px": shift_y_px,
         "delta_u": delta_u,
         "delta_v": delta_v,
+        "nuke_delta_u": nuke_delta_u,
+        "nuke_delta_v": nuke_delta_v,
         "delta_hfo_in": delta_u * (sensor_w_mm * MM_TO_INCH),
         "delta_vfo_in": delta_v * (sensor_h_mm * MM_TO_INCH),
     }
@@ -795,6 +821,19 @@ def _patch_property_static(full_text, target_model_name, property_name, op):
     return full_text
 
 
+def _remove_camera_vector_film_offset(full_text, target_model_name):
+    objs, _, attr = _resolve_camera_blocks(full_text, target_model_name)
+    attr_new = re.sub(
+        r'^[ \t]*P:\s*"FilmOffset"\s*,\s*"Vector[^"]*"\s*,.*$\r?\n?',
+        "",
+        attr["text"],
+        flags=re.MULTILINE,
+    )
+    if attr_new == attr["text"]:
+        return full_text
+    return full_text[:attr["start"]] + attr_new + full_text[attr["end"]:]
+
+
 def _unreal_film_offset_from_reframe(comp):
     # Unreal-target mapping for FBX camera offsets.
     # Units are inches because FBX FilmOffsetX/Y camera properties are in inches.
@@ -839,11 +878,9 @@ def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_
     text = apply_prop(text, "FocalLength", lambda old: old * scale)
 
     if dcc == "nuke":
-        # Nuke consumes win_translate in normalized filmback units (u/v), while FBX stores FilmOffset in inches.
-        # Convert desired win_translate deltas to FBX FilmOffset deltas using the camera filmback size.
-        dx = _nuke_win_translate_x_to_film_offset_in(-comp["delta_u"], comp["sensor_w_mm"])
-        dy = _nuke_win_translate_y_to_film_offset_in(-comp["delta_v"], comp["sensor_w_mm"])
-        # FBX FilmOffsetX/Y are inch values; after import, Nuke converts them back to normalized win_translate.
+        # For Nuke-target FBX output, write win_translate-normalized deltas directly.
+        dx = comp["nuke_delta_u"]
+        dy = comp["nuke_delta_v"]
         text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
         text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
@@ -861,8 +898,12 @@ def _apply_reframe_to_fbx_text(source_text, target_model_name, comp, dcc, force_
         text = apply_prop(text, "FilmOffsetX", lambda old: old + dx)
         text = apply_prop(text, "FilmOffsetY", lambda old: old + dy)
 
+    text = _remove_camera_vector_film_offset(text, target_model_name)
+
     if force_static:
         text = _remove_static_camera_animation(text, target_model_name)
+
+    text = _remove_unreferenced_animation_objects(text)
     return text
 
 
@@ -874,8 +915,8 @@ def _dcc_adjustments(comp):
         "nuke": {
             "focal_old_mm": focal_old,
             "focal_new_mm": focal_new,
-            "delta_x_win_translate": comp["delta_u"],
-            "delta_y_win_translate": comp["delta_v"],
+            "delta_x_win_translate": comp["nuke_delta_u"],
+            "delta_y_win_translate": comp["nuke_delta_v"],
         },
         "maya": {
             "focal_old_mm": focal_old,
