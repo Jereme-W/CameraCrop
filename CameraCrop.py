@@ -83,8 +83,6 @@ def _validate_transform(node):
     for name in required:
         if name not in node.knobs():
             raise ReframeBakeError("Transform is missing '{}' knob".format(name))
-        if _is_animated(node[name]):
-            raise ReframeBakeError("Animated Transform knobs are not supported: '{}'".format(name))
 
     if "rotate" in node.knobs() and abs(float(node["rotate"].value())) > EPS:
         raise ReframeBakeError("Transform.rotate must be 0.")
